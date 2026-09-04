@@ -62,6 +62,22 @@ export function entryId(fingerprint) {
     .slice(0, 32);
 }
 
+/**
+ * The credential reference an entry is allowed to resolve, derived from its
+ * own identity.
+ *
+ * Deliberately not taken from the registration. A signature proves which
+ * machine is calling and says nothing about which secret it may point at, so a
+ * node that chose its own reference could name *another* entry's -- enrol,
+ * wait to be approved, then repoint `host` at itself and have the proxy
+ * deliver that machine's session key. Deriving it removes the choice, and with
+ * it the whole class of bug: there is no reference a node can name but does
+ * not own.
+ */
+export function credRefFor(fingerprint) {
+  return `openhands/${entryId(fingerprint)}/session-key`;
+}
+
 export function assertSource(source) {
   if (!ENTRY_SOURCE_SET.has(source)) {
     throw new RegistryError(

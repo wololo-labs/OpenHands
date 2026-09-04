@@ -25,7 +25,7 @@ import {
   verify as verifyEd25519,
 } from "node:crypto";
 
-import { entryId, RegistryError } from "./store.mjs";
+import { credRefFor, entryId, RegistryError } from "./store.mjs";
 
 /** Fields covered by the signature, in canonical (alphabetical) order. */
 export const SIGNED_FIELDS = Object.freeze([
@@ -169,25 +169,23 @@ export function nextState(existing, preSeeded) {
 }
 
 /**
- * A credential reference is pinned at first enrolment and ignored on every
- * re-registration afterwards.
+ * Whether an entry resolves a credential, and which one.
  *
- * Nothing about a valid signature says which secret an entry may point at. A
- * node proves possession of its own host key, and without this it could then
- * re-register naming *another* entry's reference -- at which point the proxy
- * resolves that other node's session key and sends it to whatever host this
- * registration also just set. One compromised machine would harvest the
- * credential of every other machine in the fleet, which is precisely the
- * escalation the state machine above exists to prevent, one field over.
+ * The registration only gets to say *that* a credential was published, never
+ * *where*: the reference is derived from the fingerprint. Letting a node name
+ * its own reference -- even pinned to its first registration -- lets it name
+ * one it does not own. Enrol as a new machine claiming another entry's
+ * reference, wait for the routine approval, then repoint `host`, and the
+ * proxy resolves the victim's session key and delivers it. The approval is no
+ * defence: an operator approving a machine sees a name and a host, not a
+ * secret reference.
  *
- * `host` deliberately stays updatable: re-announcing after an address change
- * is the normal case this design is built around, and a caller who can sign as
- * this node already holds its host key, so pointing the entry at themselves
- * gains them only the credential they could already read off that machine.
+ * `host` stays updatable, which is only safe *because* the reference is
+ * derived: repointing an entry now yields the credential of the machine that
+ * enrolled it, which is the one whose host key signed the registration.
  */
-export function resolveCredRef(existing, requested) {
-  if (!existing) return requested;
-  return existing.credRef ?? null;
+export function resolveCredRef(fingerprint, requested) {
+  return requested ? credRefFor(fingerprint) : null;
 }
 
 function requireBodyString(body, field) {
@@ -316,7 +314,7 @@ export function createEnrolment({
         host: body.host,
         pubkey: body.pubkey,
         fingerprint,
-        credRef: resolveCredRef(existing, body.credRef),
+        credRef: resolveCredRef(fingerprint, body.credRef),
         version: body.version,
         state: nextState(existing, preSeeded.has(fingerprint)),
         lastSeen: new Date(nowMs).toISOString(),

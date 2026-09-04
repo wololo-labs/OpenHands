@@ -19,7 +19,7 @@ import {
   signRegistration,
   toSshPublicKeyLine,
 } from "../../scripts/registry/sign.mjs";
-import { defaultCredRef, parseArgs, runEnrol } from "../../bin/enrol.mjs";
+import { credRefForKeyPair, parseArgs, runEnrol } from "../../bin/enrol.mjs";
 import { createFileSecretProvider } from "../../scripts/registry/secrets/file.mjs";
 import {
   assertValidSecretRef,
@@ -418,8 +418,10 @@ describe("enrol CLI", () => {
 
     // The CLI resolves "file" through the registry of providers; point that
     // provider's root at the temp dir by pre-creating the same reference there.
+    const keyPair = await loadKeyPair(hostKeyPath);
+    const derived = credRefForKeyPair(keyPair);
     const provider = createFileSecretProvider({ root });
-    await provider.put(defaultCredRef("hetzner"), "unused");
+    await provider.put(derived, "unused");
 
     await runEnrol(
       [
@@ -430,14 +432,19 @@ describe("enrol CLI", () => {
         "--host",
         "https://hetzner.example.ts.net:8443",
         "--cred-ref",
-        defaultCredRef("hetzner"),
+        "openhands/somewhere-else/session-key",
         "--key",
         hostKeyPath,
       ],
       { log, fetchImpl: fetchImpl as unknown as typeof fetch, env: {} },
     );
 
-    expect(body.credRef).toBe("openhands/hetzner/session-key");
+    // The reference is derived from this host's fingerprint, so the value the
+    // caller asked for is not what gets registered. A node that could name its
+    // own reference could name one belonging to another machine.
+    expect(body.credRef).toBe(derived);
+    expect(body.credRef).not.toBe("openhands/somewhere-else/session-key");
+    expect(derived).toMatch(/^openhands\/[0-9a-f]{32}\/session-key$/);
     // The key itself never appears in the registration.
     expect(JSON.stringify(body)).not.toContain("unused");
   });
