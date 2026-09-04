@@ -149,6 +149,47 @@ config:
     #       name: my-llm-secret
     #       key: api-key
 
+# ── Fleet registry ───────────────────────────────────────────────────────────
+# Serves /api/registry and the credential-injecting /backend/:id proxy from
+# this release's ingress, so a browser sees the whole fleet and never holds a
+# fleet machine's session key.
+#
+# The registry authenticates with the same session key the canvas already uses,
+# so `secrets.sessionApiKey.existingSecret` must be set when this is enabled.
+# The entrypoint's auto-generated key is not visible to the chart.
+registry:
+  enabled: false
+  # SSH fingerprints (SHA256:...) that enrol straight to "active". Anything
+  # else lands in the pending queue and needs an explicit approval.
+  preseed: []
+  # Secret provider used to resolve a fleet backend's session key when
+  # proxying: "file" or "op". Leave empty to proxy only entries that carry no
+  # credential reference.
+  secretProvider: ""
+  sources:
+    kubernetes:
+      # List Services labelled app.kubernetes.io/name=agent-server in this
+      # namespace and feed them to the registry. Creates the Role and
+      # RoleBinding that permission needs.
+      enabled: false
+    tailnet:
+      # List tailnet peers tagged tag:openhands. Requires the tailscale CLI
+      # inside the pod, which the stock image does not ship.
+      enabled: false
+
+# ── Agent pool ───────────────────────────────────────────────────────────────
+# Deploy this chart a second time with `agentPool.enabled=true` to run a pool
+# of agent servers that the canvas release discovers through
+# `registry.sources.kubernetes`. It labels this release's Service so that
+# discovery finds it, and defaults to more than one replica.
+#
+# Pool members run the same all-in-one image; they simply serve a canvas
+# nobody visits. Give each member its own PVC (the default); they are not
+# shareable.
+agentPool:
+  enabled: false
+  replicas: 2
+
 secrets:
   # If provided, seed OH_SECRET_KEY (settings encryption) and the
   # session API key from Kubernetes Secrets instead of letting the

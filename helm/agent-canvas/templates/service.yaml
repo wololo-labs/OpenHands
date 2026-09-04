@@ -5,6 +5,12 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "agent-canvas.labels" . | nindent 4 }}
+    {{- if .Values.agentPool.enabled }}
+    # Discovery label read by scripts/registry/sources/k8s.mjs. It is an extra
+    # label, never a selector label: changing selectors on an existing release
+    # is rejected by Kubernetes.
+    app.kubernetes.io/name: agent-server
+    {{- end }}
   {{- with .Values.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
