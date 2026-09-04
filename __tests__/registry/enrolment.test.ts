@@ -89,12 +89,16 @@ function signBody(body: Record<string, unknown>, privateKey: KeyObject) {
   ).toString("base64");
 }
 
-function makeEnrolment(allowlist: string[] = []) {
+function makeEnrolment(
+  allowlist: string[] = [],
+  options: Record<string, unknown> = {},
+) {
   const store = createStore(createMemoryProvider());
   const enrolment = createEnrolment({
     store,
     allowlist,
     now: () => NOW_MS,
+    ...options,
   });
   return { store, enrolment };
 }
@@ -371,5 +375,123 @@ describe("createEnrolment().register", () => {
     await expect(
       enrolment.register(body, signBody(body, privateKey)),
     ).rejects.toMatchObject({ status: 400, code: "invalid_body" });
+  });
+});
+
+describe("a re-registration may not repoint another entry's secret", () => {
+  /**
+   * A valid signature says which machine is calling. It says nothing about
+   * which secret that machine may point at, and the two were being conflated:
+   * `credRef` was taken from the body on every registration.
+   *
+   * So a node holding only its own host key could re-register naming another
+   * entry's reference, and the proxy would then resolve that other node's
+   * session key and hand it to whatever `host` the same registration set.
+   * One compromised machine would harvest the whole fleet's credentials.
+   *
+   * @spec FR-007
+   */
+  it("keeps the reference pinned at first enrolment", async () => {
+    const { store, enrolment } = makeEnrolment();
+    const attacker = makeHostKey();
+
+    const first = makeBody(attacker.pubkey, {
+      name: "node-a",
+      credRef: "openhands/node-a/session-key",
+    });
+    await enrolment.register(first, signBody(first, attacker.privateKey));
+
+    const repointed = makeBody(attacker.pubkey, {
+      name: "node-a",
+      credRef: "openhands/node-b/session-key",
+      host: "https://attacker.example",
+      nonce: "nonce-2",
+    });
+    const { entry } = await enrolment.register(
+      repointed,
+      signBody(repointed, attacker.privateKey),
+    );
+
+    expect(entry.credRef).toBe("openhands/node-a/session-key");
+    expect((await store.list())[0].credRef).toBe(
+      "openhands/node-a/session-key",
+    );
+  });
+
+  it("still lets a first enrolment choose its own reference", async () => {
+    const { enrolment } = makeEnrolment();
+    const node = makeHostKey();
+    const body = makeBody(node.pubkey, { credRef: "openhands/mine/key" });
+
+    const { entry } = await enrolment.register(
+      body,
+      signBody(body, node.privateKey),
+    );
+
+    expect(entry.credRef).toBe("openhands/mine/key");
+  });
+});
+
+describe("the pending queue is bounded", () => {
+  /**
+   * Registration is unauthenticated by design and any self-generated keypair
+   * is a new fingerprint, so without a cap anyone who can reach the route can
+   * mint entries without limit -- each one a read-modify-write of the entire
+   * entry array into the agent server's settings.
+   */
+  async function enrolFresh(
+    enrolment: ReturnType<typeof makeEnrolment>["enrolment"],
+    index: number,
+  ) {
+    const key = makeHostKey();
+    const body = makeBody(key.pubkey, {
+      name: `node-${index}`,
+      nonce: `nonce-${index}`,
+    });
+    return enrolment.register(body, signBody(body, key.privateKey));
+  }
+
+  it("refuses a new pending entry once the cap is reached", async () => {
+    const { store, enrolment } = makeEnrolment([], { maxPendingEntries: 3 });
+
+    for (let index = 0; index < 3; index += 1) {
+      await enrolFresh(enrolment, index);
+    }
+
+    await expect(enrolFresh(enrolment, 99)).rejects.toMatchObject({
+      status: 429,
+      code: "too_many_pending",
+    });
+    expect(await store.list()).toHaveLength(3);
+  });
+
+  it("lets an already-listed machine re-announce past the cap", async () => {
+    const { enrolment } = makeEnrolment([], { maxPendingEntries: 1 });
+    const node = makeHostKey();
+
+    const first = makeBody(node.pubkey, { nonce: "a" });
+    await enrolment.register(first, signBody(first, node.privateKey));
+
+    // A flood must not lock out the fleet it is trying to drown.
+    const again = makeBody(node.pubkey, { nonce: "b" });
+    await expect(
+      enrolment.register(again, signBody(again, node.privateKey)),
+    ).resolves.toMatchObject({ created: false });
+  });
+
+  it("lets a pre-seeded machine enrol past the cap", async () => {
+    const node = makeHostKey();
+    const fingerprint = fingerprintFromPublicKey(node.pubkey);
+    const { enrolment } = makeEnrolment([fingerprint], {
+      maxPendingEntries: 0,
+    });
+
+    const body = makeBody(node.pubkey, { nonce: "seeded" });
+    const { entry } = await enrolment.register(
+      body,
+      signBody(body, node.privateKey),
+    );
+
+    expect(entry.state).toBe("active");
   });
 });

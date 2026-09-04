@@ -39,6 +39,15 @@ export const SIGNED_FIELDS = Object.freeze([
 ]);
 
 export const DEFAULT_REPLAY_WINDOW_SECONDS = 300;
+/**
+ * Ceiling on entries awaiting approval. Registration is unauthenticated by
+ * design, and any self-generated keypair is a new fingerprint, so without a
+ * cap anyone who can reach the route can mint entries without limit -- each
+ * one a read-modify-write of the whole entry array into the agent server's
+ * settings. The queue is something an operator reads and acts on, so a number
+ * far past what anyone would work through is already past useful.
+ */
+export const DEFAULT_MAX_PENDING_ENTRIES = 100;
 const MAX_TRACKED_NONCES = 10_000;
 const SSH_ED25519 = "ssh-ed25519";
 const ED25519_RAW_KEY_BYTES = 32;
@@ -159,6 +168,28 @@ export function nextState(existing, preSeeded) {
   return existing.state;
 }
 
+/**
+ * A credential reference is pinned at first enrolment and ignored on every
+ * re-registration afterwards.
+ *
+ * Nothing about a valid signature says which secret an entry may point at. A
+ * node proves possession of its own host key, and without this it could then
+ * re-register naming *another* entry's reference -- at which point the proxy
+ * resolves that other node's session key and sends it to whatever host this
+ * registration also just set. One compromised machine would harvest the
+ * credential of every other machine in the fleet, which is precisely the
+ * escalation the state machine above exists to prevent, one field over.
+ *
+ * `host` deliberately stays updatable: re-announcing after an address change
+ * is the normal case this design is built around, and a caller who can sign as
+ * this node already holds its host key, so pointing the entry at themselves
+ * gains them only the credential they could already read off that machine.
+ */
+export function resolveCredRef(existing, requested) {
+  if (!existing) return requested;
+  return existing.credRef ?? null;
+}
+
 function requireBodyString(body, field) {
   const value = body?.[field];
   if (typeof value !== "string" || value.trim() === "") {
@@ -183,6 +214,7 @@ export function createEnrolment({
   allowlist = [],
   now = () => Date.now(),
   replayWindowSeconds = DEFAULT_REPLAY_WINDOW_SECONDS,
+  maxPendingEntries = DEFAULT_MAX_PENDING_ENTRIES,
 }) {
   const preSeeded = new Set(
     allowlist.map(normaliseFingerprint).filter((value) => value !== null),
@@ -258,7 +290,25 @@ export function createEnrolment({
 
       const fingerprint = fingerprintFromPublicKey(body.pubkey);
       const id = entryId(fingerprint);
-      const existing = await store.get(id);
+      const entries = await store.list();
+      const existing = entries.find((entry) => entry.id === id) ?? null;
+
+      // Only a *new* entry that would land pending is capped. A machine that is
+      // already listed, and one whose fingerprint is pre-seeded, always gets
+      // through, so a flood cannot lock out the fleet it is trying to drown.
+      if (!existing && !preSeeded.has(fingerprint)) {
+        const pending = entries.filter(
+          (entry) => entry.state === "pending",
+        ).length;
+        if (pending >= maxPendingEntries) {
+          throw new RegistryError(
+            429,
+            "too_many_pending",
+            `${pending} registrations are already awaiting approval; ` +
+              "approve or revoke some before enrolling another machine",
+          );
+        }
+      }
 
       const entry = await store.upsert({
         id,
@@ -266,7 +316,7 @@ export function createEnrolment({
         host: body.host,
         pubkey: body.pubkey,
         fingerprint,
-        credRef: body.credRef,
+        credRef: resolveCredRef(existing, body.credRef),
         version: body.version,
         state: nextState(existing, preSeeded.has(fingerprint)),
         lastSeen: new Date(nowMs).toISOString(),
