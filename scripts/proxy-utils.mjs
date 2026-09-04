@@ -52,7 +52,7 @@ function parseBackendUrl(backendUrl) {
 
 function writeInvalidBackendUrlResponse(req, res) {
   const message = "Invalid backend URL";
-  console.error(`Proxy error for ${req.url}: ${message}`);
+  console.error(`Proxy error for ${logSafeUrl(req.url)}: ${message}`);
   if (!res.headersSent) {
     res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
     res.end(`Bad Gateway: ${message}`);
@@ -101,7 +101,7 @@ export function proxyServerInfoRequest(
 
       proxyRes.on("error", (err) => {
         if (!isBenignSocketError(err)) {
-          console.error(`Upstream response error for ${req.url}:`, err.message);
+          console.error(`Upstream response error for ${logSafeUrl(req.url)}:`, err.message);
         }
         if (!res.headersSent) {
           res.writeHead(502);
@@ -157,7 +157,7 @@ export function proxyServerInfoRequest(
 
   proxyReq.on("error", (err) => {
     if (!isBenignSocketError(err)) {
-      console.error(`Proxy error for ${req.url}:`, err.message);
+      console.error(`Proxy error for ${logSafeUrl(req.url)}:`, err.message);
     }
     if (!res.headersSent) {
       res.writeHead(502);
@@ -169,14 +169,14 @@ export function proxyServerInfoRequest(
 
   req.on("error", (err) => {
     if (!isBenignSocketError(err)) {
-      console.error(`Client request error for ${req.url}:`, err.message);
+      console.error(`Client request error for ${logSafeUrl(req.url)}:`, err.message);
     }
     proxyReq.destroy();
   });
 
   res.on("error", (err) => {
     if (!isBenignSocketError(err)) {
-      console.error(`Client response error for ${req.url}:`, err.message);
+      console.error(`Client response error for ${logSafeUrl(req.url)}:`, err.message);
     }
     proxyReq.destroy();
   });
@@ -201,6 +201,21 @@ function writeProxyError(res, message) {
     return;
   }
   res.destroy();
+}
+
+/**
+ * A request URL safe to write to a log.
+ *
+ * The query string is dropped rather than redacted key by key: the fleet proxy
+ * puts a resolved session key in `session_api_key` on a WebSocket upgrade
+ * (a browser cannot set a header on a handshake), and an allowlist of
+ * parameters to strip is a list somebody forgets to extend. A path is all
+ * these messages ever needed.
+ */
+export function logSafeUrl(rawUrl) {
+  const url = String(rawUrl ?? "/");
+  const separator = url.indexOf("?");
+  return separator === -1 ? url : `${url.slice(0, separator)}?…`;
 }
 
 export function createProxyHandlers({
@@ -250,7 +265,7 @@ export function createProxyHandlers({
       metrics.totalErrors += 1;
       if (!isBenignSocketError(err)) {
         console.error(
-          `[${label}] Proxy error for ${req.url} -> ${target}:`,
+          `[${label}] Proxy error for ${logSafeUrl(req.url)} -> ${target}:`,
           err,
         );
       }
@@ -279,7 +294,7 @@ export function createProxyHandlers({
         metrics.totalErrors += 1;
         if (!isBenignSocketError(err)) {
           console.error(
-            `[${label}] WebSocket proxy error for ${req.url} -> ${target}:`,
+            `[${label}] WebSocket proxy error for ${logSafeUrl(req.url)} -> ${target}:`,
             err,
           );
         }
@@ -290,7 +305,7 @@ export function createProxyHandlers({
       metrics.totalErrors += 1;
       if (!isBenignSocketError(err)) {
         console.error(
-          `[${label}] WebSocket proxy error for ${req.url} -> ${target}:`,
+          `[${label}] WebSocket proxy error for ${logSafeUrl(req.url)} -> ${target}:`,
           err,
         );
       }
