@@ -52,6 +52,7 @@ node scripts/ingress.mjs \
 | `--registry-agent-server`    | `REGISTRY_AGENT_SERVER`    | Where entries are stored (defaults to whichever backend serves `/api`) |
 | `--registry-preseed`         | `REGISTRY_PRESEED`         | Fingerprints that enrol straight to `active`                           |
 | `--registry-secret-provider` | `REGISTRY_SECRET_PROVIDER` | Resolves a fleet backend's key when proxying (`file`, `op`)            |
+| `--registry-allow-uncredentialed` | `REGISTRY_ALLOW_UNCREDENTIALED` | Proxy entries that carry no credential reference (off by default) |
 
 Entries live in the agent server's `misc_settings.fleet_backends`, so there is
 no second datastore to operate and they survive a restart.
@@ -77,7 +78,23 @@ the master's credentials.
 Replay is bounded: a registration's timestamp must be within 300 seconds
 (epoch **seconds**, not milliseconds) and its nonce must not have been used
 inside that window. The nonce is only recorded after the signature verifies, so
-an unauthenticated caller cannot grow the nonce table.
+an unauthenticated caller cannot grow the nonce table. The nonce set is
+process-local, so an ingress restart forgets it and a captured registration is
+replayable for the remainder of its window.
+
+A registration proves which machine is calling and nothing else, so a
+re-registration may not rewrite what the entry points *at*: `credRef` is pinned
+at first enrolment and ignored thereafter. Without that, a node holding only its
+own host key could re-register naming another entry's reference and have the
+proxy hand it that machine's session key. `host` stays updatable, because
+re-announcing after an address change is the case this design exists for, and a
+caller who can sign as a node already holds the credential on it.
+
+The pending queue is capped (100 by default). Registration is unauthenticated
+and every fresh keypair is a new fingerprint, so the cap is what stops anyone
+who can reach the route from minting entries without limit. An already-listed
+machine and a pre-seeded one are never refused, so a flood cannot lock out the
+fleet it is trying to drown.
 
 ## Enrolment
 
@@ -131,10 +148,32 @@ reference when proxying `/backend/<id>/*`.
 | `file`   | One 0600 file per reference under `~/.openhands/agent-canvas/secrets` | No dependency, no daemon; as confidential as the filesystem                   |
 | `op`     | The installed `op` CLI                                                | Maps a reference to `op://<vault>/<item>/password`; must already be signed in |
 
-The proxy fails closed. An unknown entry is `404`, an entry that is not
-`active` is `403`, and a credential the provider cannot resolve is `502`. None
-of those fall back to proxying without a credential, and any credential the
-caller sent is stripped before the request goes out.
+The proxy authenticates its caller with the master's session key, the one the
+canvas already holds for this origin, and answers `401` without it. That check
+is not optional decoration: `/api/*` reaches an agent server that authenticates
+for itself, whereas here the proxy satisfies the node's authentication on the
+caller's behalf, so an unchecked caller is a caller handed the whole fleet. A
+WebSocket handshake cannot set a header, so the key is also accepted as a
+`session_api_key` query parameter.
+
+What the browser sends is never what the node receives. Every channel a caller
+credential can arrive in is stripped -- `X-Session-API-Key`, `Authorization`,
+`Proxy-Authorization`, `Cookie`, `X-API-Key`, and the query parameter -- and the
+entry's own credential is attached in its place. Cookies matter here because the
+proxy shares an origin with the canvas, so the browser attaches them without
+being asked.
+
+The proxy fails closed. An unauthenticated caller is `401`, an unknown entry is
+`404`, an entry that is not `active` is `403`, an entry with no credential
+reference is `403`, and a credential the provider cannot resolve is `502`. None
+of those fall back to proxying without a credential.
+
+An entry with no `credRef` is refused rather than relayed to uncredentialed.
+Discovered entries are that shape by construction, so a deployment that wants
+them reachable has to say so with `--registry-allow-uncredentialed` and accept
+what it means: the proxy will forward to those machines with no credential at
+all, which on an agent server that does not authenticate makes `/backend/:id` an
+open relay into whatever the source listed.
 
 Where `tailscale whois` can name the caller, a configured policy decides
 whether that caller may reach that entry. With no policy configured no identity

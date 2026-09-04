@@ -117,13 +117,30 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
 ### FR-019: The browser never holds a fleet key
 
 - [x] `/backend/:id/*` shall resolve the entry's credential server-side and
-      attach it outbound, and shall strip any credential the caller sent.
+      attach it outbound, and shall strip any credential the caller sent, in
+      the header and in the query string alike.
+
+### FR-019a: The proxy authenticates its caller
+
+- [x] `/backend/:id/*` shall require the master's session key, in the
+      `X-Session-API-Key` header or the `session_api_key` query parameter that
+      a WebSocket handshake must use, and shall answer `401` without it before
+      it reads the registry. The proxy satisfies the node's own authentication
+      on the caller's behalf, so a caller it does not check is a caller granted
+      the whole fleet.
 
 ### FR-020: The proxy fails closed
 
 - [x] An unknown entry shall be `404`, an entry that is not `active` shall be
-      `403`, and a credential the provider cannot resolve shall be `502`. None
-      shall fall back to proxying without a credential.
+      `403`, an entry carrying no credential reference shall be `403`, and a
+      credential the provider cannot resolve shall be `502`. None shall fall
+      back to proxying without a credential.
+
+- [x] A deployment that wants an uncredentialed entry proxied anyway shall say
+      so explicitly with `--registry-allow-uncredentialed`. Discovered entries
+      have no credential reference by construction, so this is the difference
+      between a source that lists a machine and a source that grants
+      unauthenticated access to it.
 
 ### FR-021: Caller identity is available to a policy
 
