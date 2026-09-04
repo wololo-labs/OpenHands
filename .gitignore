@@ -17,6 +17,7 @@ __pycache__
 
 /test-results/
 /test-results-live/
+/test-results-fleet-registry/
 /test-results-mock-llm/
 /test-results-mock-llm-docker/
 /.mock-llm-markers/
