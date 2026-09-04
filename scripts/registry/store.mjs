@@ -143,7 +143,18 @@ export function normaliseEntry(input) {
 }
 
 export function createStore(provider) {
+  // Bumped by every mutation so a reader can tell, without asking the
+  // provider, whether anything it cached is still current. The fleet proxy
+  // reads the entry list on every proxied request, and a per-request round
+  // trip to the agent server is both a latency cost on the hot path and an
+  // amplification lever; this is what lets it cache without going stale
+  // across an approval or a revocation.
+  let revision = 0;
+
   return {
+    getRevision() {
+      return revision;
+    },
     async list() {
       return provider.list();
     },
@@ -152,13 +163,19 @@ export function createStore(provider) {
       return entries.find((entry) => entry.id === id) ?? null;
     },
     async upsert(entry) {
-      return provider.upsert(normaliseEntry(entry));
+      const stored = await provider.upsert(normaliseEntry(entry));
+      revision += 1;
+      return stored;
     },
     async remove(id) {
-      return provider.remove(id);
+      const removed = await provider.remove(id);
+      revision += 1;
+      return removed;
     },
     async setState(id, state) {
-      return provider.setState(id, assertState(state));
+      const updated = await provider.setState(id, assertState(state));
+      revision += 1;
+      return updated;
     },
   };
 }

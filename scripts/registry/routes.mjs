@@ -10,10 +10,9 @@
  * provisioned node has its own host key but none of the master's credentials.
  */
 
-import { timingSafeEqual } from "node:crypto";
-
 import { createEnrolment } from "./enrolment.mjs";
 import { createInlineProvider } from "./providers/inline.mjs";
+import { secretMatches } from "./session-key.mjs";
 import { createStore, RegistryError } from "./store.mjs";
 
 const REGISTRY_PREFIX = "/api/registry";
@@ -47,17 +46,6 @@ function sendError(res, error) {
     console.error(`[registry] ${code}:`, error);
   }
   sendJson(res, status, { error: code, message });
-}
-
-function secretMatches(provided, expected) {
-  if (typeof provided !== "string") {
-    return false;
-  }
-  // Compared as bytes, not characters: a non-ASCII value of the same string
-  // length produces a different buffer length, which timingSafeEqual throws on.
-  const a = Buffer.from(provided, "utf8");
-  const b = Buffer.from(expected, "utf8");
-  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 async function readJsonBody(req, maxBodyBytes) {

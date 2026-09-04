@@ -24,6 +24,8 @@
  *                           straight to "active"
  *   REGISTRY_SECRET_PROVIDER - Secret provider used to resolve a fleet
  *                           backend's session key when proxying /backend/:id
+ *   REGISTRY_ALLOW_UNCREDENTIALED - Proxy fleet entries that carry no
+ *                           credential reference (off by default)
  *   REGISTRY_SOURCE_KUBERNETES - Populate the registry from Services labelled
  *                           app.kubernetes.io/name=agent-server
  *   REGISTRY_SOURCE_TAILNET - Populate the registry from tailnet peers tagged
@@ -72,6 +74,7 @@ function parseArgs() {
     registryAgentServer: null,
     registryPreseed: [],
     registrySecretProvider: null,
+    registryAllowUncredentialed: false,
     registrySources: [],
   };
 
@@ -115,6 +118,9 @@ function parseArgs() {
         break;
       case "--registry-secret-provider":
         config.registrySecretProvider = args[++i] || null;
+        break;
+      case "--registry-allow-uncredentialed":
+        config.registryAllowUncredentialed = true;
         break;
       case "--registry-source":
         config.registrySources.push(args[++i]);
@@ -164,6 +170,12 @@ OPTIONS:
                               Secret provider used to resolve a fleet
                               backend's session key when proxying
                               /backend/:id (file, op)
+  --registry-allow-uncredentialed
+                              Proxy fleet entries that carry no credential
+                              reference. Off by default: such an entry is
+                              relayed to with no credential at all, which on
+                              an agent server that does not authenticate
+                              makes /backend/:id an open relay.
   --registry-source <name>    Populate the registry from a directory that
                               already knows the fleet (k8s, tailnet).
                               Repeatable.
@@ -179,6 +191,8 @@ ENVIRONMENT VARIABLES:
   REGISTRY_AGENT_SERVER       Agent server storing the registry
   REGISTRY_PRESEED            Pre-seeded SSH fingerprints
   REGISTRY_SECRET_PROVIDER    Secret provider for proxied fleet credentials
+  REGISTRY_ALLOW_UNCREDENTIALED
+                              Proxy fleet entries that carry no credential
   REGISTRY_SOURCE_KUBERNETES  Populate the registry from labelled Services
   REGISTRY_SOURCE_TAILNET     Populate the registry from tagged tailnet peers
 
@@ -264,6 +278,9 @@ function buildRegistryConfig(args, env, routes, defaultBackend) {
     ],
     secretProvider:
       args.registrySecretProvider || env.REGISTRY_SECRET_PROVIDER || null,
+    allowUncredentialed:
+      args.registryAllowUncredentialed ||
+      Boolean(env.REGISTRY_ALLOW_UNCREDENTIALED),
     sources: {
       kubernetes:
         args.registrySources?.includes("k8s") ||
@@ -329,6 +346,11 @@ export function startIngress(config) {
         secrets: config.registry.secretProvider
           ? createSecretProvider(config.registry.secretProvider)
           : null,
+        // The proxy authenticates its callers with the same key the registry
+        // routes use; it injects fleet credentials, so it cannot be the one
+        // route on this origin that asks nothing of whoever is calling.
+        sessionKey: config.registry.sessionKey,
+        allowUncredentialed: config.registry.allowUncredentialed ?? false,
         proxy,
       })
     : null;

@@ -18,6 +18,8 @@ import { server as mswServer } from "#/mocks/node";
 import { createProxyHandlers } from "../../scripts/proxy-utils.mjs";
 import {
   applyCredential,
+  applyCredentialToPath,
+  callerCredential,
   createBackendProxy,
   createTailscaleIdentityResolver,
   isBackendProxyRequest,
@@ -26,6 +28,21 @@ import {
 import { createFileSecretProvider } from "../../scripts/registry/secrets/file.mjs";
 
 type Entry = Record<string, unknown> & { id: string; state: string };
+
+/**
+ * The master's own session key. The proxy injects fleet credentials, so it
+ * cannot be the one route on this origin that asks nothing of its caller;
+ * every request below presents this the way the canvas does.
+ */
+const MASTER_KEY = "master-session-key";
+
+/** `fetch` as the canvas makes it: authenticated to the master, and only that. */
+function callerFetch(url: string, init: RequestInit = {}) {
+  return fetch(url, {
+    ...init,
+    headers: { "X-Session-API-Key": MASTER_KEY, ...(init.headers ?? {}) },
+  });
+}
 
 async function listen(server: Server) {
   await new Promise<void>((resolve, reject) => {
@@ -61,12 +78,23 @@ function createFakeBackend() {
 }
 
 function createMemoryStore(entries: Entry[]) {
+  let revision = 0;
   return {
+    getRevision() {
+      return revision;
+    },
     async list() {
       return entries;
     },
     async get(id: string) {
       return entries.find((entry) => entry.id === id) ?? null;
+    },
+    /** Mirrors the real store: a mutation bumps the revision readers watch. */
+    async setState(id: string, state: string) {
+      const entry = entries.find((candidate) => candidate.id === id);
+      if (entry) entry.state = state;
+      revision += 1;
+      return entry ?? null;
     },
   };
 }
@@ -79,8 +107,21 @@ describe("parseBackendProxyUrl", () => {
     ["/backend/abc/api/x?y=1", { id: "abc", path: "/api/x?y=1" }],
     ["/backend/a%2Fb/x", { id: "a/b", path: "/x" }],
   ])("parses %s", (url, expected) => {
-    expect(parseBackendProxyUrl(url)).toEqual(expected);
+    expect(parseBackendProxyUrl(url)).toMatchObject(expected);
   });
+
+  /**
+   * This runs inside the server's `request` and `upgrade` listeners, where a
+   * throw is caught by nothing and takes the process down. One unauthenticated
+   * `GET /backend/%` used to be enough to stop the ingress.
+   */
+  it.each(["/backend/%", "/backend/%zz", "/backend/%/api", "/backend/a%2"])(
+    "returns null rather than throwing on %s",
+    (url) => {
+      expect(() => parseBackendProxyUrl(url)).not.toThrow();
+      expect(parseBackendProxyUrl(url)).toBeNull();
+    },
+  );
 
   it.each(["/backend", "/backend/", "/backends/abc", "/api/registry", "/"])(
     "does not claim %s",
@@ -112,6 +153,73 @@ describe("applyCredential", () => {
     applyCredential(headers, null);
 
     expect(headers["x-session-api-key"]).toBeUndefined();
+  });
+
+  /**
+   * The proxy lives on the canvas's own origin, so the browser attaches that
+   * origin's cookies to every proxied request without being asked. Forwarding
+   * them hands a live canvas credential to whichever machine the entry names.
+   */
+  it("strips every channel a caller credential can arrive in", () => {
+    const headers: Record<string, string> = {
+      "x-session-api-key": "attacker-key",
+      authorization: "Bearer attacker",
+      "proxy-authorization": "Basic attacker",
+      cookie: "session=canvas-session-cookie",
+      cookie2: "legacy=value",
+      "x-api-key": "attacker",
+      accept: "application/json",
+    };
+
+    applyCredential(headers, "fleet-key");
+
+    expect(headers["x-session-api-key"]).toBe("fleet-key");
+    expect(headers.authorization).toBeUndefined();
+    expect(headers["proxy-authorization"]).toBeUndefined();
+    expect(headers.cookie).toBeUndefined();
+    expect(headers.cookie2).toBeUndefined();
+    expect(headers["x-api-key"]).toBeUndefined();
+    expect(headers.accept).toBe("application/json");
+  });
+});
+
+describe("applyCredentialToPath", () => {
+  it("removes the caller's key from the query string", () => {
+    const search = new URLSearchParams("limit=5&session_api_key=callers-key");
+
+    expect(applyCredentialToPath("/api/x", search, null)).toBe("/api/x?limit=5");
+  });
+
+  it("keeps the credential out of an ordinary request's URL", () => {
+    const search = new URLSearchParams("session_api_key=callers-key");
+
+    // The header carries it instead, so it stays out of the node's access log.
+    expect(applyCredentialToPath("/api/x", search, "fleet-key")).toBe("/api/x");
+  });
+
+  it("puts it back for an upgrade, where a browser cannot set a header", () => {
+    const search = new URLSearchParams("session_api_key=callers-key");
+
+    expect(
+      applyCredentialToPath("/sockets", search, "fleet-key", { inQuery: true }),
+    ).toBe("/sockets?session_api_key=fleet-key");
+  });
+});
+
+describe("callerCredential", () => {
+  it("prefers the header and falls back to the query parameter", () => {
+    const headers = { "x-session-api-key": "from-header" };
+
+    expect(callerCredential({ headers }, new URLSearchParams())).toBe(
+      "from-header",
+    );
+    expect(
+      callerCredential(
+        { headers: {} },
+        new URLSearchParams("session_api_key=from-query"),
+      ),
+    ).toBe("from-query");
+    expect(callerCredential({ headers: {} }, new URLSearchParams())).toBe("");
   });
 });
 
@@ -145,17 +253,19 @@ describe("backend proxy", () => {
     overrides: Record<string, unknown> = {},
   ) {
     proxyHandlers = createProxyHandlers({ label: "test" });
+    const store = createMemoryStore(entries);
     const backendProxy = createBackendProxy({
-      store: createMemoryStore(entries),
+      store,
       secrets: createFileSecretProvider({ root: secretsRoot }),
       proxy: proxyHandlers,
+      sessionKey: MASTER_KEY,
       ...overrides,
     });
     ingress = createServer((req, res) => {
       void backendProxy.handle(req, res);
     });
     base = await listen(ingress);
-    return backendProxy;
+    return { backendProxy, store };
   }
 
   function activeEntry(overrides: Partial<Entry> = {}): Entry {
@@ -183,7 +293,7 @@ describe("backend proxy", () => {
   it("reaches the backend with a credential the caller never had", async () => {
     await mount([activeEntry()]);
 
-    const response = await fetch(`${base}/backend/abc123/api/settings`);
+    const response = await callerFetch(`${base}/backend/abc123/api/settings`);
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ url: "/api/settings" });
@@ -196,7 +306,7 @@ describe("backend proxy", () => {
   it("carries the query string through", async () => {
     await mount([activeEntry()]);
 
-    await fetch(`${base}/backend/abc123/api/conversations?limit=5`);
+    await callerFetch(`${base}/backend/abc123/api/conversations?limit=5`);
 
     expect(backend.seen[0].url).toBe("/api/conversations?limit=5");
   });
@@ -204,7 +314,7 @@ describe("backend proxy", () => {
   it("returns 403 for a revoked entry and never contacts the backend", async () => {
     await mount([activeEntry({ state: "revoked" })]);
 
-    const response = await fetch(`${base}/backend/abc123/api/settings`);
+    const response = await callerFetch(`${base}/backend/abc123/api/settings`);
 
     expect(response.status).toBe(403);
     expect(await response.json()).toMatchObject({ error: "not_active" });
@@ -214,7 +324,7 @@ describe("backend proxy", () => {
   it("returns 403 for an entry still pending approval", async () => {
     await mount([activeEntry({ state: "pending" })]);
 
-    expect((await fetch(`${base}/backend/abc123/api/settings`)).status).toBe(
+    expect((await callerFetch(`${base}/backend/abc123/api/settings`)).status).toBe(
       403,
     );
   });
@@ -222,7 +332,7 @@ describe("backend proxy", () => {
   it("returns 404 for an id the registry does not know", async () => {
     await mount([activeEntry()]);
 
-    const response = await fetch(`${base}/backend/nope/api/settings`);
+    const response = await callerFetch(`${base}/backend/nope/api/settings`);
 
     expect(response.status).toBe(404);
     expect(await response.json()).toMatchObject({ error: "not_found" });
@@ -231,7 +341,7 @@ describe("backend proxy", () => {
   it("degrades to a clear error when the secret cannot be resolved", async () => {
     await mount([activeEntry({ credRef: "openhands/missing/session-key" })]);
 
-    const response = await fetch(`${base}/backend/abc123/api/settings`);
+    const response = await callerFetch(`${base}/backend/abc123/api/settings`);
 
     expect(response.status).toBe(502);
     expect(await response.json()).toMatchObject({
@@ -244,7 +354,7 @@ describe("backend proxy", () => {
   it("says so when an entry needs a credential and no provider is configured", async () => {
     await mount([activeEntry()], { secrets: null });
 
-    const response = await fetch(`${base}/backend/abc123/api/settings`);
+    const response = await callerFetch(`${base}/backend/abc123/api/settings`);
 
     expect(response.status).toBe(502);
     expect(await response.json()).toMatchObject({
@@ -252,14 +362,109 @@ describe("backend proxy", () => {
     });
   });
 
-  it("proxies an entry with no credential reference without inventing one", async () => {
+  it("refuses an entry with no credential reference", async () => {
+    // @spec FR-020 - nothing is proxied uncredentialed by default. Discovered
+    // entries are this shape, so without the refusal the proxy becomes an
+    // unauthenticated relay to whatever a source happened to list.
     await mount([activeEntry({ credRef: null })]);
 
-    await fetch(`${base}/backend/abc123/api/settings`, {
-      headers: { "X-Session-API-Key": "smuggled" },
+    const response = await callerFetch(`${base}/backend/abc123/api/settings`);
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: "no_credential" });
+    expect(backend.seen).toHaveLength(0);
+  });
+
+  it("proxies an uncredentialed entry only when the deployment opted in", async () => {
+    await mount([activeEntry({ credRef: null })], {
+      allowUncredentialed: true,
     });
 
+    await callerFetch(`${base}/backend/abc123/api/settings`);
+
+    // Opting in permits an absent credential; it never permits the caller's
+    // own to be forwarded in its place.
     expect(backend.seen[0].sessionKey).toBeUndefined();
+  });
+
+  describe("caller authentication", () => {
+    /**
+     * The proxy satisfies the fleet node's authentication on the caller's
+     * behalf, so without a check of its own it would be strictly weaker than
+     * the `/api/*` route it sits beside: anyone who could reach the ingress
+     * would reach every active machine in the fleet.
+     */
+    it("refuses a caller that presents no session key", async () => {
+      await mount([activeEntry()]);
+
+      const response = await fetch(`${base}/backend/abc123/api/settings`);
+
+      expect(response.status).toBe(401);
+      expect(await response.json()).toMatchObject({ error: "unauthorized" });
+      expect(backend.seen).toHaveLength(0);
+    });
+
+    it("refuses a caller that presents the wrong session key", async () => {
+      await mount([activeEntry()]);
+
+      const response = await fetch(`${base}/backend/abc123/api/settings`, {
+        headers: { "X-Session-API-Key": "not-the-master-key" },
+      });
+
+      expect(response.status).toBe(401);
+      expect(backend.seen).toHaveLength(0);
+    });
+
+    it("refuses the fleet node's own key: it authorises the node, not a caller", async () => {
+      await mount([activeEntry()]);
+
+      const response = await fetch(`${base}/backend/abc123/api/settings`, {
+        headers: { "X-Session-API-Key": "fleet-key" },
+      });
+
+      expect(response.status).toBe(401);
+    });
+
+    it("does not reveal whether an entry exists to an unauthenticated caller", async () => {
+      await mount([activeEntry()]);
+
+      const known = await fetch(`${base}/backend/abc123/api/settings`);
+      const unknown = await fetch(`${base}/backend/nope/api/settings`);
+
+      expect(known.status).toBe(401);
+      expect(unknown.status).toBe(401);
+    });
+
+    it("accepts the key from the query string, as a WebSocket must send it", async () => {
+      await mount([activeEntry()]);
+
+      const response = await fetch(
+        `${base}/backend/abc123/api/settings?session_api_key=${MASTER_KEY}`,
+      );
+
+      expect(response.status).toBe(200);
+      // Swapped for the node's, never forwarded, and never left in the URL of
+      // an ordinary request where it would land in the node's access log.
+      expect(backend.seen[0].sessionKey).toBe("fleet-key");
+      expect(backend.seen[0].url).not.toContain("session_api_key");
+    });
+  });
+
+  /**
+   * The entry list is cached to keep a full settings fetch off the hot path,
+   * but revocation is a security control: it has to bite on the next request,
+   * not at the end of a cache window.
+   */
+  it("sees a revocation immediately despite caching the entry list", async () => {
+    const { store } = await mount([activeEntry()]);
+
+    expect((await callerFetch(`${base}/backend/abc123/api/x`)).status).toBe(200);
+
+    await store.setState("abc123", "revoked");
+
+    const response = await callerFetch(`${base}/backend/abc123/api/x`);
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: "not_active" });
   });
 
   it("resolves a credential once and reuses it", async () => {
@@ -267,8 +472,8 @@ describe("backend proxy", () => {
     const get = vi.spyOn(secrets, "get");
     await mount([activeEntry()], { secrets });
 
-    await fetch(`${base}/backend/abc123/api/settings`);
-    await fetch(`${base}/backend/abc123/api/settings`);
+    await callerFetch(`${base}/backend/abc123/api/settings`);
+    await callerFetch(`${base}/backend/abc123/api/settings`);
 
     expect(get).toHaveBeenCalledTimes(1);
   });
@@ -280,7 +485,7 @@ describe("backend proxy", () => {
       resolveIdentity: async () => ({ user: "someone@example.com" }),
     });
 
-    const response = await fetch(`${base}/backend/abc123/api/settings`);
+    const response = await callerFetch(`${base}/backend/abc123/api/settings`);
 
     expect(response.status).toBe(403);
     expect(await response.json()).toMatchObject({ error: "forbidden" });
@@ -295,7 +500,7 @@ describe("backend proxy", () => {
     const resolveIdentity = vi.fn();
     await mount([activeEntry()], { resolveIdentity });
 
-    await fetch(`${base}/backend/abc123/api/settings`);
+    await callerFetch(`${base}/backend/abc123/api/settings`);
 
     expect(resolveIdentity).not.toHaveBeenCalled();
   });
