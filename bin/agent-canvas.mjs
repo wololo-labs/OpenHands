@@ -24,6 +24,21 @@ const DEFAULTS_JSON = join(__dirname, "..", "config", "defaults.json");
 
 // Check for version/help/info/public flags first
 const args = process.argv.slice(2);
+
+// `agent-canvas enrol ...` registers this machine with a fleet registry.
+// Dispatched before every other flag so that `--host` and `--version` there
+// mean what enrol means by them, not what the launcher means.
+if (args[0] === "enrol") {
+  const { runEnrol } = await import("./enrol.mjs");
+  try {
+    process.exit(await runEnrol(args.slice(1)));
+  } catch (error) {
+    console.error(
+      `enrol failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    process.exit(1);
+  }
+}
 if (args.includes("-v") || args.includes("--version")) {
   const { version } = JSON.parse(readFileSync(PKG_JSON, "utf-8"));
   console.log(version);
