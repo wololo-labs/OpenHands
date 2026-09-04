@@ -75,7 +75,6 @@ export function parseBackendProxyUrl(rawUrl) {
     id,
     pathname: `/${segments.slice(3).join("/")}`,
     search: url.searchParams,
-    path: `/${segments.slice(3).join("/")}${url.search}`,
   };
 }
 

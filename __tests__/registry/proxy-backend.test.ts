@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, request as httpRequest, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -44,7 +44,16 @@ function callerFetch(url: string, init: RequestInit = {}) {
   });
 }
 
+/** Sockets each test server has accepted, so teardown can drop upgraded ones. */
+const openSockets = new WeakMap<Server, Set<{ destroy(): void }>>();
+
 async function listen(server: Server) {
+  const sockets = new Set<{ destroy(): void }>();
+  openSockets.set(server, sockets);
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => resolve());
@@ -54,8 +63,42 @@ async function listen(server: Server) {
 
 async function close(server: Server | undefined) {
   if (!server?.listening) return;
+  // An upgraded socket outlives its request, so `close()` on its own waits
+  // forever for a connection the test deliberately left open.
+  for (const socket of openSockets.get(server) ?? []) socket.destroy();
   await new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+/**
+ * Opens a WebSocket handshake the way a browser does: no custom headers, only
+ * what the URL carries. Resolves with the upstream's status line, or "101"
+ * when the upgrade completed.
+ */
+function handshake(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(url, {
+      headers: {
+        Connection: "Upgrade",
+        Upgrade: "websocket",
+        "Sec-WebSocket-Version": "13",
+        "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+      },
+    });
+    req.on("upgrade", (res, socket) => {
+      socket.destroy();
+      resolve(String(res.statusCode ?? 101));
+    });
+    req.on("response", (res) => {
+      res.resume();
+      resolve(String(res.statusCode));
+    });
+    // A refused upgrade is a destroyed socket with no reply at all, which is
+    // the only signal the proxy can give on this path.
+    req.on("error", () => resolve("destroyed"));
+    req.on("close", () => resolve("destroyed"));
+    req.end();
   });
 }
 
@@ -73,6 +116,16 @@ function createFakeBackend() {
     }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ url: req.url }));
+  });
+  // Accept upgrades too, recording what actually arrived at the fleet node.
+  server.on("upgrade", (req, socket) => {
+    seen.push({
+      url: req.url ?? "",
+      sessionKey: req.headers["x-session-api-key"] as string | undefined,
+    });
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    );
   });
   return { server, seen };
 }
@@ -101,11 +154,11 @@ function createMemoryStore(entries: Entry[]) {
 
 describe("parseBackendProxyUrl", () => {
   it.each([
-    ["/backend/abc/api/settings", { id: "abc", path: "/api/settings" }],
-    ["/backend/abc", { id: "abc", path: "/" }],
-    ["/backend/abc/", { id: "abc", path: "/" }],
-    ["/backend/abc/api/x?y=1", { id: "abc", path: "/api/x?y=1" }],
-    ["/backend/a%2Fb/x", { id: "a/b", path: "/x" }],
+    ["/backend/abc/api/settings", { id: "abc", pathname: "/api/settings" }],
+    ["/backend/abc", { id: "abc", pathname: "/" }],
+    ["/backend/abc/", { id: "abc", pathname: "/" }],
+    ["/backend/abc/api/x?y=1", { id: "abc", pathname: "/api/x" }],
+    ["/backend/a%2Fb/x", { id: "a/b", pathname: "/x" }],
   ])("parses %s", (url, expected) => {
     expect(parseBackendProxyUrl(url)).toMatchObject(expected);
   });
@@ -263,6 +316,9 @@ describe("backend proxy", () => {
     });
     ingress = createServer((req, res) => {
       void backendProxy.handle(req, res);
+    });
+    ingress.on("upgrade", (req, socket, head) => {
+      void backendProxy.handleUpgrade(req, socket, head);
     });
     base = await listen(ingress);
     return { backendProxy, store };
@@ -447,6 +503,69 @@ describe("backend proxy", () => {
       // an ordinary request where it would land in the node's access log.
       expect(backend.seen[0].sessionKey).toBe("fleet-key");
       expect(backend.seen[0].url).not.toContain("session_api_key");
+    });
+  });
+
+  /**
+   * The upgrade path had no test at all, which is how it shipped requiring a
+   * credential a browser cannot send. A browser sets no headers on a
+   * handshake, so everything here goes through the URL -- exactly what the
+   * canvas does for a fleet backend.
+   */
+  describe("websocket upgrades", () => {
+    it("connects when the handshake URL carries the master's key", async () => {
+      await mount([activeEntry()]);
+
+      const status = await handshake(
+        `${base}/backend/abc123/sockets/events?session_api_key=${MASTER_KEY}`,
+      );
+
+      expect(status).toBe("101");
+      // The node is reached with *its* credential, in the channel it reads.
+      expect(backend.seen[0].url).toContain("session_api_key=fleet-key");
+      expect(backend.seen[0].url).not.toContain(MASTER_KEY);
+      expect(backend.seen[0].url).toContain("/sockets/events");
+    });
+
+    it("refuses a handshake that carries no credential", async () => {
+      await mount([activeEntry()]);
+
+      expect(await handshake(`${base}/backend/abc123/sockets/events`)).toBe(
+        "destroyed",
+      );
+      expect(backend.seen).toHaveLength(0);
+    });
+
+    it("refuses a handshake carrying the fleet node's own key", async () => {
+      await mount([activeEntry()]);
+
+      const status = await handshake(
+        `${base}/backend/abc123/sockets/events?session_api_key=fleet-key`,
+      );
+
+      expect(status).toBe("destroyed");
+      expect(backend.seen).toHaveLength(0);
+    });
+
+    it("refuses an upgrade to an entry that is not active", async () => {
+      await mount([activeEntry({ state: "pending" })]);
+
+      expect(
+        await handshake(
+          `${base}/backend/abc123/sockets/events?session_api_key=${MASTER_KEY}`,
+        ),
+      ).toBe("destroyed");
+    });
+
+    it("survives a malformed entry id on the upgrade path", async () => {
+      await mount([activeEntry()]);
+
+      await handshake(`${base}/backend/%/sockets`);
+
+      // Still serving: the parse must not throw inside the upgrade listener.
+      expect(
+        (await callerFetch(`${base}/backend/abc123/api/settings`)).status,
+      ).toBe(200);
     });
   });
 
