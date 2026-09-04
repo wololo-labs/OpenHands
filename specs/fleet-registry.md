@@ -110,6 +110,11 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
 - [x] The registration shall carry only a credential reference; the key itself
       goes to the secret provider.
 
+- [x] The stored reference shall be derived from the entry's fingerprint rather
+      than taken from the registration, so no machine can name a reference
+      belonging to another. Pinning a caller-supplied reference at first
+      enrolment is insufficient: the first enrolment can be the attacker's.
+
 ---
 
 ## Phase 4: credential resolution and ingress injection
@@ -123,11 +128,15 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
 ### FR-019a: The proxy authenticates its caller
 
 - [x] `/backend/:id/*` shall require the master's session key, in the
-      `X-Session-API-Key` header or the `session_api_key` query parameter that
-      a WebSocket handshake must use, and shall answer `401` without it before
-      it reads the registry. The proxy satisfies the node's own authentication
-      on the caller's behalf, so a caller it does not check is a caller granted
-      the whole fleet.
+      `X-Session-API-Key` header or the `session_api_key` query parameter, and
+      shall answer `401` without it before it reads the registry. The proxy
+      satisfies the node's own authentication on the caller's behalf, so a
+      caller it does not check is a caller granted the whole fleet.
+
+- [x] A fleet WebSocket shall present that key on the handshake URL, since a
+      browser can set no header on an upgrade and a proxy cannot act on a
+      post-open `auth` frame, and shall not also send that frame, which would
+      relay this origin's key to the fleet machine unrewritten.
 
 ### FR-020: The proxy fails closed
 

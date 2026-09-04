@@ -47,9 +47,9 @@ function normalizeHost(host: string): string {
  * backend for its key. Resolving the two independently is a credential leak:
  * an override of `{ host, sessionApiKey: null }` means "this host has no key",
  * and `??` reads that `null` as "unspecified", so the active backend's key
- * would be sent to a host it does not belong to. A fleet entry reached through
- * the injecting proxy is exactly that shape — its `apiKey` is empty because
- * the ingress attaches the real one server-side (see `scripts/proxy-backend.mjs`).
+ * would be sent to a host it does not belong to. A manual backend with a blank
+ * key is exactly that shape, and so is any call naming a conversation runtime
+ * alongside the key for it.
  */
 function resolveTarget(
   overrides: AgentServerClientOverrides,

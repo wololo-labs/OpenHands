@@ -498,11 +498,17 @@ enrols `active`, anything else lands `pending` and cannot be selected until
 approved. `ts` in a registration is epoch **seconds**, and both ends import the
 same `canonicalPayload()` so the signed bytes cannot drift.
 
-A fleet entry's `apiKey` is empty on purpose -- the ingress attaches the real
-one. `getAgentServerClientOptions()` therefore resolves a host and its
-credential from the same source: a call naming its own host sends that host's
-key or none. Never reintroduce a fallback to the active backend's key for a
-call that names a host, or that key travels to a host it does not belong to.
+A fleet entry carries *this origin's* session key, never the node's: the proxy
+authenticates the caller with it, then strips it and substitutes the node's own.
+`getAgentServerClientOptions()` resolves a host and its credential from the same
+source, so a call naming its own host sends that host's key or none. Never
+reintroduce a fallback to the active backend's key for a call that names a host,
+or that key travels to a host it does not belong to.
+
+The same rule applies to WebSockets, where it is easy to get wrong: a fleet
+socket authenticates on the handshake query (`handshakeAuth`) and must *not*
+also send the post-open `auth` frame, which the proxy cannot rewrite and would
+relay to the fleet machine with this origin's key in it.
 
 The unit tests all use fakes. `tests/e2e/live/fleet-registry/` is the only
 thing that exercises the loop against real machines -- `rig.mjs up`, then

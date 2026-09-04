@@ -82,13 +82,30 @@ an unauthenticated caller cannot grow the nonce table. The nonce set is
 process-local, so an ingress restart forgets it and a captured registration is
 replayable for the remainder of its window.
 
-A registration proves which machine is calling and nothing else, so a
-re-registration may not rewrite what the entry points *at*: `credRef` is pinned
-at first enrolment and ignored thereafter. Without that, a node holding only its
-own host key could re-register naming another entry's reference and have the
-proxy hand it that machine's session key. `host` stays updatable, because
-re-announcing after an address change is the case this design exists for, and a
-caller who can sign as a node already holds the credential on it.
+A registration proves which machine is calling and nothing else, so it does not
+get to say which secret the entry resolves. The credential reference is
+**derived** from the fingerprint -- `openhands/<entry id>/session-key` -- and
+whatever the registration asks for is ignored; all it decides is whether there
+is a credential at all.
+
+Pinning the reference to an entry's first registration is not enough, which is
+worth spelling out because it looks like it should be. The first registration
+can be the attacker's: enrol as a brand new machine already naming a victim's
+reference, wait for the routine approval (an operator approving a machine sees
+a name and a host, never a secret reference), then re-register to repoint
+`host`. Deriving the reference removes the choice, and with it the whole class
+of attack -- there is no reference a node can name but does not own.
+
+`host` stays updatable, which is safe *because* the reference is derived:
+repointing an entry yields only the credential of the machine whose host key
+signed the registration. Re-announcing after a reboot or an address change is
+the case this design exists for.
+
+`agent-canvas enrol` derives the same reference, so it publishes the session
+key where the registry will look for it and prints the location. A machine that
+enrolled before its secret existed is repaired by re-running enrol with a
+secret provider; the reference is deterministic, so nothing has to be
+hand-edited.
 
 The pending queue is capped (100 by default). Registration is unauthenticated
 and every fresh keypair is a new fingerprint, so the cap is what stops anyone
@@ -152,9 +169,16 @@ The proxy authenticates its caller with the master's session key, the one the
 canvas already holds for this origin, and answers `401` without it. That check
 is not optional decoration: `/api/*` reaches an agent server that authenticates
 for itself, whereas here the proxy satisfies the node's authentication on the
-caller's behalf, so an unchecked caller is a caller handed the whole fleet. A
-WebSocket handshake cannot set a header, so the key is also accepted as a
-`session_api_key` query parameter.
+caller's behalf, so an unchecked caller is a caller handed the whole fleet.
+
+A WebSocket needs its own arrangement, because a browser can set no header on a
+handshake and the canvas normally authenticates a socket with an `auth` frame
+sent after it opens. A proxy cannot act on a frame. So a fleet socket carries
+the key on the handshake URL instead (`handshakeAuth` in `use-websocket.ts`),
+and the post-open frame is suppressed for those sockets. Both halves matter:
+without the first the socket never connects, and without the second this
+origin's key is relayed verbatim to the fleet machine inside a frame the proxy
+cannot rewrite.
 
 What the browser sends is never what the node receives. Every channel a caller
 credential can arrive in is stripped -- `X-Session-API-Key`, `Authorization`,
