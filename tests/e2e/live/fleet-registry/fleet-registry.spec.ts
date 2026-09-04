@@ -76,7 +76,7 @@ async function proxyStatus(
   request: APIRequestContext,
   entryId: string,
   path_ = "/api/conversations/search",
-  headers: Record<string, string> = {},
+  headers: Record<string, string> = masterAuth,
 ): Promise<number> {
   const response = await request.get(
     `${rig.baseUrl}/backend/${entryId}${path_}`,
@@ -192,7 +192,10 @@ function reEnrolNode2(): string {
       rig.keys.node2,
       "--generate-key",
     ],
-    { encoding: "utf8", env: { ...process.env, HOME: path.join(rig.dir, "home") } },
+    {
+      encoding: "utf8",
+      env: { ...process.env, HOME: path.join(rig.dir, "home") },
+    },
   ).trim();
 }
 
@@ -227,8 +230,9 @@ test("reads and approvals need the master key; registration does not", async ({
   expect(withNodeKey.status()).toBe(401);
 
   expect(
-    (await request.get(`${rig.baseUrl}/api/registry`, { headers: masterAuth }))
-      .status(),
+    (
+      await request.get(`${rig.baseUrl}/api/registry`, { headers: masterAuth })
+    ).status(),
   ).toBe(200);
 });
 
@@ -282,21 +286,29 @@ test("Manage Backends shows provenance and offers approve, not delete", async ({
   await openCanvas(page);
   await openManageBackends(page);
 
-  await expect(page.getByTestId(`manage-backends-provenance-${NODE1}`)).toHaveText(
-    "From the fleet registry",
-  );
-  await expect(page.getByTestId(`manage-backends-provenance-${NODE2}`)).toHaveText(
-    "Pending approval",
-  );
+  await expect(
+    page.getByTestId(`manage-backends-provenance-${NODE1}`),
+  ).toHaveText("From the fleet registry");
+  await expect(
+    page.getByTestId(`manage-backends-provenance-${NODE2}`),
+  ).toHaveText("Pending approval");
   await expect(
     page.getByTestId(`manage-backends-provenance-${MANUAL_BACKEND_NAME}`),
   ).toHaveText("Added manually");
 
   // Fleet entries are server-owned: the browser's copy is a cache.
-  await expect(page.getByTestId(`manage-backends-edit-${NODE1}`)).toHaveCount(0);
-  await expect(page.getByTestId(`manage-backends-remove-${NODE1}`)).toHaveCount(0);
-  await expect(page.getByTestId(`manage-backends-revoke-${NODE1}`)).toHaveCount(1);
-  await expect(page.getByTestId(`manage-backends-approve-${NODE2}`)).toHaveCount(1);
+  await expect(page.getByTestId(`manage-backends-edit-${NODE1}`)).toHaveCount(
+    0,
+  );
+  await expect(page.getByTestId(`manage-backends-remove-${NODE1}`)).toHaveCount(
+    0,
+  );
+  await expect(page.getByTestId(`manage-backends-revoke-${NODE1}`)).toHaveCount(
+    1,
+  );
+  await expect(
+    page.getByTestId(`manage-backends-approve-${NODE2}`),
+  ).toHaveCount(1);
 
   // The manual entry survives hydration with its own affordances intact.
   await expect(
@@ -323,11 +335,12 @@ test("approving from the UI makes the entry connectable", async ({
   await openManageBackends(page);
   await page.getByTestId(`manage-backends-approve-${NODE2}`).click();
 
-  await expect(page.getByTestId(`manage-backends-provenance-${NODE2}`)).toHaveText(
-    "From the fleet registry",
-    { timeout: 20_000 },
+  await expect(
+    page.getByTestId(`manage-backends-provenance-${NODE2}`),
+  ).toHaveText("From the fleet registry", { timeout: 20_000 });
+  await expect(page.getByTestId(`manage-backends-revoke-${NODE2}`)).toHaveCount(
+    1,
   );
-  await expect(page.getByTestId(`manage-backends-revoke-${NODE2}`)).toHaveCount(1);
   console.log(`evidence: ${await shot(page, "03-approved")}`);
 
   expect(entryNamed(await listEntries(request), NODE2).state).toBe("active");
@@ -361,9 +374,10 @@ test("the browser holds no fleet credential and sends none", async ({
   // Drive real traffic at both entries so the assertion has something to bite
   // on: health probes for the fleet rows run as soon as the list hydrates.
   await openManageBackends(page);
-  await expect(
-    page.getByTestId(`manage-backends-status-${NODE1}`),
-  ).toHaveText("Connected", { timeout: 30_000 });
+  await expect(page.getByTestId(`manage-backends-status-${NODE1}`)).toHaveText(
+    "Connected",
+    { timeout: 30_000 },
+  );
 
   const storage = await page.evaluate(() => {
     const dump = (store: Storage) =>
@@ -373,15 +387,19 @@ test("the browser holds no fleet credential and sends none", async ({
     return `${dump(window.localStorage)}\n${dump(window.sessionStorage)}`;
   });
 
-  expect(storage.length, "storage should not be empty for this to mean anything")
-    .toBeGreaterThan(0);
+  expect(
+    storage.length,
+    "storage should not be empty for this to mean anything",
+  ).toBeGreaterThan(0);
   expect(storage, `${NODE1}'s session key reached the browser`).not.toContain(
     rig.keys.node1,
   );
   expect(storage, `${NODE2}'s session key reached the browser`).not.toContain(
     rig.keys.node2,
   );
-  // The hydrated entries carry an empty apiKey, not a placeholder for one.
+  // A hydrated entry carries *this origin's* key, which the browser is
+  // entitled to and which the ingress requires before it will proxy at all.
+  // What it must never carry is a node's own key.
   const backends = await page.evaluate(() =>
     JSON.parse(window.localStorage.getItem("openhands-backends") ?? "[]"),
   );
@@ -389,18 +407,40 @@ test("the browser holds no fleet credential and sends none", async ({
     (backend) => backend.provenance === "registry",
   );
   expect(fleet).toHaveLength(2);
-  expect(fleet.every((backend) => backend.apiKey === "")).toBe(true);
+  expect(fleet.every((backend) => backend.apiKey === rig.keys.master)).toBe(
+    true,
+  );
+  expect(
+    fleet.some(
+      (backend) =>
+        backend.apiKey === rig.keys.node1 || backend.apiKey === rig.keys.node2,
+    ),
+  ).toBe(false);
 
-  expect(proxied.length, "no request reached the proxy to inspect").toBeGreaterThan(0);
+  expect(
+    proxied.length,
+    "no request reached the proxy to inspect",
+  ).toBeGreaterThan(0);
   for (const request of proxied) {
     const headers = await request.allHeaders();
-    expect(
-      headers["x-session-api-key"],
-      `${request.method()} ${request.url()} carried a fleet credential`,
-    ).toBeUndefined();
+    const sent = headers["x-session-api-key"];
+    const where = `${request.method()} ${request.url()}`;
+
+    // The browser authenticates to the *master* -- the proxy injects fleet
+    // credentials, so it cannot be the one route on this origin that asks
+    // nothing of its caller. What matters is which key that is.
+    expect(sent, `${where} reached the proxy unauthenticated`).toBe(
+      rig.keys.master,
+    );
+    expect(sent, `${where} carried ${NODE1}'s key`).not.toBe(rig.keys.node1);
+    expect(sent, `${where} carried ${NODE2}'s key`).not.toBe(rig.keys.node2);
+    expect(request.url(), `${where} carried a key in the URL`).not.toContain(
+      rig.keys.node1,
+    );
   }
   console.log(
-    `evidence: ${proxied.length} browser requests to /backend/*, none carrying X-Session-API-Key`,
+    `evidence: ${proxied.length} browser requests to /backend/*, every one ` +
+      "authenticated with the master's key and none carrying a node's",
   );
 });
 
@@ -433,15 +473,84 @@ test("the proxy injects each entry's own credential, and only its own", async ({
   expect(await direct(rig.node1Url, rig.keys.node2)).toBe(401);
   expect(await direct(rig.node2Url, rig.keys.node1)).toBe(401);
 
-  // A credential the caller supplies is stripped, not merged or preferred.
-  expect(
-    await proxyStatus(request, rig.entries.node1.id, "/api/conversations/search", {
-      "X-Session-API-Key": "a-key-the-caller-made-up",
-    }),
-  ).toBe(200);
+  // The substitution, stated as a contradiction: the caller presents only the
+  // master's key, and the master's key is not accepted by either node. A 200
+  // is therefore only explicable by the proxy having swapped in the node's own.
+  expect(await direct(rig.node1Url, rig.keys.master)).toBe(401);
+  expect(await direct(rig.node2Url, rig.keys.master)).toBe(401);
 
   // An entry that does not exist never falls back to an uncredentialed proxy.
   expect(await proxyStatus(request, "0".repeat(32))).toBe(404);
+});
+
+test("the proxy refuses a caller it cannot authenticate", async ({
+  request,
+}) => {
+  // @spec FR-019a
+  // Without this the route is strictly weaker than the `/api/*` it sits beside:
+  // there the agent server authenticates for itself, here the proxy does it on
+  // the caller's behalf, so an unchecked caller is handed the whole fleet.
+  const unauthenticated = { "X-Not-A-Credential": "1" };
+  expect(
+    await proxyStatus(
+      request,
+      rig.entries.node1.id,
+      "/api/conversations/search",
+      unauthenticated,
+    ),
+  ).toBe(401);
+  expect(
+    await proxyStatus(
+      request,
+      rig.entries.node2.id,
+      "/api/conversations/search",
+      unauthenticated,
+    ),
+  ).toBe(401);
+
+  // A node's own key authorises that node, never a caller of the fleet.
+  expect(
+    await proxyStatus(
+      request,
+      rig.entries.node1.id,
+      "/api/conversations/search",
+      {
+        "X-Session-API-Key": rig.keys.node1,
+      },
+    ),
+  ).toBe(401);
+
+  // An unauthenticated caller cannot even learn which entry ids exist.
+  expect(
+    await proxyStatus(
+      request,
+      "0".repeat(32),
+      "/api/conversations/search",
+      unauthenticated,
+    ),
+  ).toBe(401);
+});
+
+test("a malformed entry id does not take the ingress down", async ({
+  request,
+}) => {
+  // `decodeURIComponent("%")` throws, and this parse runs inside the server's
+  // request and upgrade listeners where nothing catches it. One unauthenticated
+  // request used to be enough to stop the whole ingress.
+  for (const path of ["/backend/%", "/backend/%zz", "/backend/%/api/x"]) {
+    const response = await request.get(`${rig.baseUrl}${path}`, {
+      failOnStatusCode: false,
+    });
+    expect(response.status()).toBeLessThan(500);
+  }
+
+  // Still serving afterwards, which is the actual assertion.
+  expect(
+    (
+      await request.get(`${rig.baseUrl}/api/registry`, { headers: masterAuth })
+    ).status(),
+  ).toBe(200);
+  expect(await proxyStatus(request, rig.entries.node1.id)).toBe(200);
 });
 
 test("a browser that has never seen the fleet renders it anyway", async ({
@@ -461,10 +570,14 @@ test("a browser that has never seen the fleet renders it anyway", async ({
   });
 
   await page.getByTestId("backend-selector").hover();
-  await expect(page.locator("li").filter({ hasText: NODE1 }).first()).toBeVisible({
+  await expect(
+    page.locator("li").filter({ hasText: NODE1 }).first(),
+  ).toBeVisible({
     timeout: 20_000,
   });
-  await expect(page.locator("li").filter({ hasText: NODE2 }).first()).toBeVisible();
+  await expect(
+    page.locator("li").filter({ hasText: NODE2 }).first(),
+  ).toBeVisible();
 
   const hydrated = await page.evaluate(() =>
     JSON.parse(window.localStorage.getItem("openhands-backends") ?? "[]"),
@@ -490,8 +603,11 @@ test("a conversation runs on the remote node through the proxy", async ({
 
   // The remote node's own settings drive the agent; the request carries no
   // credential of any kind.
-  const settings = await (await request.get(`${proxied}/api/settings`)).json();
+  const settings = await (
+    await request.get(`${proxied}/api/settings`, { headers: masterAuth })
+  ).json();
   const created = await request.post(`${proxied}/api/conversations`, {
+    headers: masterAuth,
     data: {
       workspace: { kind: "LocalWorkspace", working_dir: "workspace/project" },
       agent_settings: settings.agent_settings,
@@ -508,15 +624,18 @@ test("a conversation runs on the remote node through the proxy", async ({
   // The conversation is stored on the *remote* machine, under its persistence
   // directory, not the master's.
   expect(conversation.persistence_dir).toContain("/home/");
-  expect(await request.get(`${proxied}/api/conversations/${conversation.id}`))
-    .toBeTruthy();
+  expect(
+    await request.get(`${proxied}/api/conversations/${conversation.id}`, {
+      headers: masterAuth,
+    }),
+  ).toBeTruthy();
 
   // An initial message starts the agent on its own, so this either kicks it off
   // (200) or finds it already running (409). Both mean the remote node accepted
   // the work; anything else means it did not.
   const run = await request.post(
     `${proxied}/api/conversations/${conversation.id}/run`,
-    { failOnStatusCode: false },
+    { headers: masterAuth, failOnStatusCode: false },
   );
   expect([200, 409], `run returned ${run.status()}`).toContain(run.status());
 
@@ -536,7 +655,7 @@ test("a conversation runs on the remote node through the proxy", async ({
       async () => {
         const response = await request.get(
           `${proxied}/api/conversations/${conversation.id}/events/search?page_size=50`,
-          { failOnStatusCode: false },
+          { headers: masterAuth, failOnStatusCode: false },
         );
         if (!response.ok()) return "";
         events = ((await response.json()).items ?? []) as ConversationEvent[];
@@ -568,6 +687,7 @@ test("a conversation runs on the remote node through the proxy", async ({
   );
 
   await request.delete(`${proxied}/api/conversations/${conversation.id}`, {
+    headers: masterAuth,
     failOnStatusCode: false,
   });
 });
@@ -613,9 +733,12 @@ test("revoking one node 403s its path and leaves the other working", async ({
   await page.getByTestId(`manage-backends-revoke-${NODE1}`).click();
 
   // A revoked entry disappears from the list rather than lingering greyed out.
-  await expect(page.getByTestId(`manage-backends-row-${NODE1}`)).toHaveCount(0, {
-    timeout: 20_000,
-  });
+  await expect(page.getByTestId(`manage-backends-row-${NODE1}`)).toHaveCount(
+    0,
+    {
+      timeout: 20_000,
+    },
+  );
   await expect(page.getByTestId(`manage-backends-row-${NODE2}`)).toHaveCount(1);
   console.log(`evidence: ${await shot(page, "05-revoked")}`);
 
