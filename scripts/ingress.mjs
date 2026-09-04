@@ -15,6 +15,19 @@
  *   INGRESS_DEFAULT       - Default backend for unmatched routes
  *   INGRESS_RUNTIME_SERVICES_INFO - Runtime services JSON appended to
  *                                   /server_info
+ *   REGISTRY_SESSION_KEY  - Enables the in-process fleet registry on
+ *                           /api/registry/* and authenticates its read and
+ *                           approval routes
+ *   REGISTRY_AGENT_SERVER - Agent server that stores the registry (defaults
+ *                           to whichever backend serves /api)
+ *   REGISTRY_PRESEED      - Comma/space separated SSH fingerprints that enrol
+ *                           straight to "active"
+ *   REGISTRY_SECRET_PROVIDER - Secret provider used to resolve a fleet
+ *                           backend's session key when proxying /backend/:id
+ *   REGISTRY_SOURCE_KUBERNETES - Populate the registry from Services labelled
+ *                           app.kubernetes.io/name=agent-server
+ *   REGISTRY_SOURCE_TAILNET - Populate the registry from tailnet peers tagged
+ *                           tag:openhands
  *
  * Route matching:
  *   - Routes are matched by longest prefix first
@@ -33,6 +46,15 @@ import {
   matchesPathPrefix,
   proxyServerInfoRequest,
 } from "./proxy-utils.mjs";
+import { createBackendProxy, isBackendProxyRequest } from "./proxy-backend.mjs";
+import { createRegistry, isRegistryRequest } from "./registry/routes.mjs";
+import { createSecretProvider } from "./registry/secrets/interface.mjs";
+import {
+  readInClusterConfig,
+  syncKubernetesSource,
+} from "./registry/sources/k8s.mjs";
+import { startSourceLoop } from "./registry/sources/sync.mjs";
+import { syncTailnetSource } from "./registry/sources/tailnet.mjs";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration
@@ -46,6 +68,11 @@ function parseArgs() {
     defaultBackend: null,
     noReferrerPrefixes: [],
     runtimeServicesInfo: null,
+    registrySessionKey: null,
+    registryAgentServer: null,
+    registryPreseed: [],
+    registrySecretProvider: null,
+    registrySources: [],
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -77,6 +104,21 @@ function parseArgs() {
       case "--runtime-services-info":
         config.runtimeServicesInfo = args[++i] || null;
         break;
+      case "--registry-session-key":
+        config.registrySessionKey = args[++i] || null;
+        break;
+      case "--registry-agent-server":
+        config.registryAgentServer = args[++i] || null;
+        break;
+      case "--registry-preseed":
+        config.registryPreseed.push(...parseFingerprintList(args[++i]));
+        break;
+      case "--registry-secret-provider":
+        config.registrySecretProvider = args[++i] || null;
+        break;
+      case "--registry-source":
+        config.registrySources.push(args[++i]);
+        break;
       case "-h":
       case "--help":
         showHelp();
@@ -85,6 +127,14 @@ function parseArgs() {
   }
 
   return config;
+}
+
+/** Splits a comma/space separated fingerprint list, dropping empties. */
+function parseFingerprintList(value) {
+  return String(value ?? "")
+    .split(/[\s,]+/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
 }
 
 function showHelp() {
@@ -104,6 +154,19 @@ OPTIONS:
                               responses under <p>. For upstreams whose URL
                               carries a credential in the query string.
   --runtime-services-info     Runtime services JSON for /server_info
+  --registry-session-key <k>  Enable the fleet registry on /api/registry/*
+                              and require <k> on its read/approval routes
+  --registry-agent-server <u> Agent server storing the registry (defaults to
+                              the backend serving /api)
+  --registry-preseed <fprs>   SSH fingerprints that enrol straight to
+                              "active" (comma or space separated, repeatable)
+  --registry-secret-provider <name>
+                              Secret provider used to resolve a fleet
+                              backend's session key when proxying
+                              /backend/:id (file, op)
+  --registry-source <name>    Populate the registry from a directory that
+                              already knows the fleet (k8s, tailnet).
+                              Repeatable.
   -h, --help                  Show this help
 
 ENVIRONMENT VARIABLES:
@@ -112,6 +175,12 @@ ENVIRONMENT VARIABLES:
   INGRESS_DEFAULT             Default backend URL
   INGRESS_RUNTIME_SERVICES_INFO
                               Runtime services JSON for /server_info
+  REGISTRY_SESSION_KEY        Enable and authenticate the fleet registry
+  REGISTRY_AGENT_SERVER       Agent server storing the registry
+  REGISTRY_PRESEED            Pre-seeded SSH fingerprints
+  REGISTRY_SECRET_PROVIDER    Secret provider for proxied fleet credentials
+  REGISTRY_SOURCE_KUBERNETES  Populate the registry from labelled Services
+  REGISTRY_SOURCE_TAILNET     Populate the registry from tagged tailnet peers
 
 EXAMPLES:
   # Basic setup with agent server and automation
@@ -147,14 +216,96 @@ function buildConfig(args, env = process.env) {
     }
   }
 
+  const defaultBackend = args.defaultBackend || env.INGRESS_DEFAULT || null;
+
   return {
     port: args.port || parseInt(env.INGRESS_PORT, 10) || 8000,
     routes,
-    defaultBackend: args.defaultBackend || env.INGRESS_DEFAULT || null,
+    defaultBackend,
     noReferrerPrefixes: args.noReferrerPrefixes ?? [],
     runtimeServicesInfo:
       args.runtimeServicesInfo || env.INGRESS_RUNTIME_SERVICES_INFO || null,
+    registry: buildRegistryConfig(args, env, routes, defaultBackend),
   };
+}
+
+/**
+ * The registry is off unless a session key is configured, so an ingress
+ * started the way it is today behaves exactly as it does today.
+ *
+ * Its entries live in the agent server's `misc_settings`, and that server is
+ * already in the route table, so the URL defaults to whichever backend serves
+ * `/api` rather than being configured twice.
+ */
+function buildRegistryConfig(args, env, routes, defaultBackend) {
+  const sessionKey =
+    args.registrySessionKey || env.REGISTRY_SESSION_KEY || null;
+  if (!sessionKey) {
+    return null;
+  }
+
+  const agentServerUrl =
+    args.registryAgentServer ||
+    env.REGISTRY_AGENT_SERVER ||
+    createRouter(routes, defaultBackend)("/api/settings");
+  if (!agentServerUrl) {
+    throw new Error(
+      "Registry is enabled but no agent server was found to store it in. " +
+        "Pass --registry-agent-server <url> or add an /api route.",
+    );
+  }
+
+  return {
+    sessionKey,
+    agentServerUrl,
+    preSeededFingerprints: [
+      ...(args.registryPreseed ?? []),
+      ...parseFingerprintList(env.REGISTRY_PRESEED),
+    ],
+    secretProvider:
+      args.registrySecretProvider || env.REGISTRY_SECRET_PROVIDER || null,
+    sources: {
+      kubernetes:
+        args.registrySources?.includes("k8s") ||
+        Boolean(env.REGISTRY_SOURCE_KUBERNETES),
+      tailnet:
+        args.registrySources?.includes("tailnet") ||
+        Boolean(env.REGISTRY_SOURCE_TAILNET),
+    },
+  };
+}
+
+/**
+ * Starts the configured pull sources. Each runs independently, so a cluster
+ * the pod cannot reach never stops the tailnet source (or signed enrolment)
+ * from working.
+ */
+function startRegistrySources(registryConfig, store) {
+  const stops = [];
+
+  if (registryConfig.sources?.kubernetes) {
+    let config = null;
+    stops.push(
+      startSourceLoop({
+        name: "k8s",
+        sync: async () => {
+          config = config ?? (await readInClusterConfig());
+          await syncKubernetesSource({ store, config });
+        },
+      }),
+    );
+  }
+
+  if (registryConfig.sources?.tailnet) {
+    stops.push(
+      startSourceLoop({
+        name: "tailnet",
+        sync: () => syncTailnetSource({ store }),
+      }),
+    );
+  }
+
+  return () => stops.forEach((stop) => stop());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -167,9 +318,45 @@ export function startIngress(config) {
   const uninstallDiagnostics = proxy.installDiagnostics();
 
   const noReferrerPrefixes = config.noReferrerPrefixes ?? [];
+  const registry = config.registry ? createRegistry(config.registry) : null;
+  // The proxy is mounted with the registry, so a fleet entry can always be
+  // reached at /backend/:id without a second thing to configure. An entry with
+  // a credential reference and no provider fails there with a clear error
+  // rather than silently proxying uncredentialed.
+  const backendProxy = registry
+    ? createBackendProxy({
+        store: registry.store,
+        secrets: config.registry.secretProvider
+          ? createSecretProvider(config.registry.secretProvider)
+          : null,
+        proxy,
+      })
+    : null;
+  const stopRegistrySources = registry
+    ? startRegistrySources(config.registry, registry.store)
+    : () => {};
 
   const server = createServer((req, res) => {
     const url = req.url ?? "/";
+
+    // Served here rather than proxied: a node enrolling for the first time
+    // has no session key, so this route cannot live behind the agent server.
+    if (registry && isRegistryRequest(req)) {
+      registry.handle(req, res).catch((err) => {
+        console.error(`Registry error for ${url}:`, err);
+        res.destroy();
+      });
+      return;
+    }
+
+    if (backendProxy && isBackendProxyRequest(req)) {
+      backendProxy.handle(req, res).catch((err) => {
+        console.error(`Backend proxy error for ${url}:`, err);
+        res.destroy();
+      });
+      return;
+    }
+
     const backend = route(url);
 
     if (!backend) {
@@ -199,6 +386,13 @@ export function startIngress(config) {
 
   // Handle WebSocket upgrades
   server.on("upgrade", (req, socket, head) => {
+    if (backendProxy && isBackendProxyRequest(req)) {
+      backendProxy
+        .handleUpgrade(req, socket, head)
+        .catch(() => socket.destroy());
+      return;
+    }
+
     const backend = route(req.url ?? "/");
 
     if (!backend) {
@@ -221,7 +415,10 @@ export function startIngress(config) {
       socket.destroy();
     }
   });
-  server.on("close", uninstallDiagnostics);
+  server.on("close", () => {
+    uninstallDiagnostics();
+    stopRegistrySources();
+  });
 
   server.listen(config.port, () => {
     console.log("");
@@ -255,6 +452,14 @@ export function startIngress(config) {
     if (config.defaultBackend) {
       const line = `    * (default) → ${config.defaultBackend}`;
       console.log(`║  ${line.padEnd(61)}║`);
+    }
+
+    if (registry) {
+      const line = `    /api/registry → ${config.registry.agentServerUrl}`;
+      console.log(`║  ${line.padEnd(61)}║`);
+      const provider = config.registry.secretProvider ?? "none";
+      const proxyLine = `    /backend/:id → fleet (secrets: ${provider})`;
+      console.log(`║  ${proxyLine.padEnd(61)}║`);
     }
 
     console.log(
