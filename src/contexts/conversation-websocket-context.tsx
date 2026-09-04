@@ -8,6 +8,7 @@ import React, {
   useMemo,
   useRef,
 } from "react";
+import { isFleetProxyUrl } from "#/api/backend-registry/registry-source";
 import { ConversationClient } from "@openhands/typescript-client/clients";
 
 import { useQueryClient } from "@tanstack/react-query";
@@ -1004,6 +1005,11 @@ export function ConversationWebSocketProvider({
     return {
       queryParams,
       sessionApiKey,
+      // A fleet conversation is reached through this origin's proxy, which has
+      // to read the credential on the handshake to decide whether to connect
+      // at all -- and must not be handed this origin's key in a frame it would
+      // relay to the fleet machine untouched.
+      handshakeAuth: isFleetProxyUrl(conversationUrl),
       reconnect: { enabled: true },
       onOpen: () => {
         setMainConnectionState("OPEN");
@@ -1043,6 +1049,9 @@ export function ConversationWebSocketProvider({
     return {
       queryParams,
       sessionApiKey: planningApiKey,
+      handshakeAuth: isFleetProxyUrl(
+        planningAgentConversation?.conversation_url ?? conversationUrl,
+      ),
       reconnect: { enabled: true },
       onOpen: async () => {
         setPlanningConnectionState("OPEN");

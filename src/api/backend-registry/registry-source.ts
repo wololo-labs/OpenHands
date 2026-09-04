@@ -19,6 +19,9 @@ export const REGISTRY_ID_PREFIX = "registry:";
 
 export const REGISTRY_HYDRATION_INTERVAL_MS = 60_000;
 
+/** Path prefix the ingress mounts the credential-injecting proxy on. */
+export const BACKEND_PROXY_PREFIX = "/backend";
+
 export interface RegistryEntry {
   id: string;
   name: string;
@@ -100,7 +103,27 @@ export function backendProxyHost(entryId: string): string {
     typeof window === "undefined"
       ? ""
       : window.location.origin.replace(/\/+$/, "");
-  return `${origin}/backend/${encodeURIComponent(entryId)}`;
+  return `${origin}${BACKEND_PROXY_PREFIX}/${encodeURIComponent(entryId)}`;
+}
+
+/**
+ * Whether a URL is reached through this origin's fleet proxy.
+ *
+ * A fleet backend's host is `<origin>/backend/<entry id>`, and traffic to it
+ * has to authenticate to the proxy rather than to the machine at the far end.
+ * That changes how a WebSocket must present its credential, which is why the
+ * question is asked about a URL rather than carried on the backend record: the
+ * socket layer only ever sees the URL.
+ */
+export function isFleetProxyUrl(url: string | null | undefined): boolean {
+  if (!url) return false;
+  try {
+    return new URL(url, window.location.origin).pathname.startsWith(
+      `${BACKEND_PROXY_PREFIX}/`,
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**

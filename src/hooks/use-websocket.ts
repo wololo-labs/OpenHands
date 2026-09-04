@@ -5,6 +5,19 @@ import { startHandshakeWatchdog } from "#/utils/websocket-handshake";
 export interface WebSocketHookOptions {
   queryParams?: Record<string, string | boolean>;
   sessionApiKey?: string | null;
+  /**
+   * Send the session key on the handshake URL instead of in an `auth` frame
+   * after the socket opens.
+   *
+   * Needed when something between this browser and the agent server has to
+   * read the credential to decide whether the connection is allowed at all --
+   * the fleet proxy at `/backend/:id`, which authenticates the caller and then
+   * substitutes the node's own key. A proxy cannot act on a frame, and a
+   * browser cannot set a header on an upgrade, so the query string is the only
+   * channel left. It also keeps this origin's key out of a frame that would be
+   * relayed verbatim to the fleet machine.
+   */
+  handshakeAuth?: boolean;
   onOpen?: (event: Event) => void;
   onClose?: (event: CloseEvent) => void;
   onMessage?: (event: MessageEvent) => void;
@@ -39,16 +52,22 @@ export const useWebSocket = (url: string, options?: WebSocketHookOptions) => {
   const connectWebSocket = React.useCallback(() => {
     // Build URL with query parameters if provided
     let wsUrl = url;
-    if (optionsRef.current?.queryParams) {
-      const stringParams = Object.entries(
-        optionsRef.current.queryParams,
-      ).reduce(
-        (acc, [key, value]) => {
-          acc[key] = String(value);
-          return acc;
-        },
-        {} as Record<string, string>,
-      );
+    const handshakeKey = optionsRef.current?.handshakeAuth
+      ? (optionsRef.current?.sessionApiKey ?? null)
+      : null;
+    const stringParams = Object.entries(
+      optionsRef.current?.queryParams ?? {},
+    ).reduce(
+      (acc, [key, value]) => {
+        acc[key] = String(value);
+        return acc;
+      },
+      {} as Record<string, string>,
+    );
+    if (handshakeKey) {
+      stringParams.session_api_key = handshakeKey;
+    }
+    if (Object.keys(stringParams).length > 0) {
       const params = new URLSearchParams(stringParams);
       wsUrl = `${url}?${params.toString()}`;
     }
@@ -65,7 +84,12 @@ export const useWebSocket = (url: string, options?: WebSocketHookOptions) => {
 
     ws.onopen = (event) => {
       cancelHandshakeWatchdog();
-      sendWebSocketAuth(ws, optionsRef.current?.sessionApiKey);
+      // Already authenticated on the handshake, and re-sending it here would
+      // put this origin's key in a frame the proxy cannot rewrite, delivering
+      // it verbatim to the fleet machine.
+      if (!optionsRef.current?.handshakeAuth) {
+        sendWebSocketAuth(ws, optionsRef.current?.sessionApiKey);
+      }
       setIsConnected(true);
       setError(null); // Clear any previous errors
       setIsReconnecting(false);
