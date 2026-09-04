@@ -97,6 +97,10 @@ spec:
             - name: REGISTRY_SECRET_PROVIDER
               value: {{ . | quote }}
             {{- end }}
+            {{- if .Values.registry.allowUncredentialed }}
+            - name: REGISTRY_ALLOW_UNCREDENTIALED
+              value: "1"
+            {{- end }}
             {{- if .Values.registry.sources.kubernetes.enabled }}
             - name: REGISTRY_SOURCE_KUBERNETES
               value: "1"

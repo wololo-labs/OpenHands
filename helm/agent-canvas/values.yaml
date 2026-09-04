@@ -163,9 +163,16 @@ registry:
   # else lands in the pending queue and needs an explicit approval.
   preseed: []
   # Secret provider used to resolve a fleet backend's session key when
-  # proxying: "file" or "op". Leave empty to proxy only entries that carry no
-  # credential reference.
+  # proxying: "file" or "op". Leave empty only when no entry carries a
+  # credential reference; an entry that does will then fail with 502 rather
+  # than being proxied without one.
   secretProvider: ""
+  # Proxy entries that carry no credential reference at all. Off by default:
+  # such an entry is relayed to with no credential, which on an agent server
+  # that does not authenticate makes /backend/:id an open relay. Entries found
+  # by the discovery sources below have no credential reference, so this is the
+  # difference between listing a machine and granting access to it.
+  allowUncredentialed: false
   sources:
     kubernetes:
       # List Services labelled app.kubernetes.io/name=agent-server in this
