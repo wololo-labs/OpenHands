@@ -40,6 +40,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { credRefFor } from "../../../../scripts/registry/store.mjs";
+
 const REPO_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../../..",
@@ -459,7 +461,10 @@ async function registryEntries(state) {
  */
 async function enrolNode1(state) {
   const masterUrl = `http://${tailnetAddress()}:${state.ports.ingress}`;
-  const credRef = `openhands/${NODE1.name}/session-key`;
+  // The registry derives the reference it stores from the fingerprint and
+  // ignores whatever the registration asks for, so the out-of-band placement
+  // below has to use the derived one too.
+  const credRef = credRefFor(state.node1Fingerprint);
   const version = await remoteAgentServerVersion(state);
   const output = ssh(
     [
@@ -472,7 +477,7 @@ async function enrolNode1(state) {
       `--version ${shellQuote(version)}`,
     ].join(" "),
   );
-  log(`${NODE1.name} enrol -> ${output}`);
+  log(`${NODE1.name} enrol -> ${enrolResultLine(output)}`);
 
   // Out-of-band credential placement: the provisioner's job in a real
   // deployment, and the reason the registration carries a reference only.
@@ -509,8 +514,18 @@ function enrolNode2(state) {
       env: { ...process.env, HOME: state.home },
     },
   );
-  log(`${NODE2_NAME} enrol -> ${output.split("\n")[0]}`);
+  log(`${NODE2_NAME} enrol -> ${enrolResultLine(output)}`);
   return output;
+}
+
+/**
+ * The `<state> <id>` line out of an enrol run. `enrol` also prints where the
+ * session key has to live, so neither the first nor the last line is reliably
+ * the result.
+ */
+function enrolResultLine(output) {
+  const match = String(output).match(/^(pending|active|stale|revoked) \S+$/m);
+  return match ? match[0] : String(output).trim();
 }
 
 function writeSecret(state, ref, secret) {

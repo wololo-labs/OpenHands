@@ -255,8 +255,12 @@ test("a pre-seeded fingerprint enrols active, an unknown one lands pending", asy
   expect(node1.fingerprint).toBe(rig.node1Fingerprint);
   expect(node1.fingerprint).toMatch(/^SHA256:/);
 
-  // Neither registration carried a key, only a reference to one.
-  expect(node1.credRef).toBe(`openhands/${NODE1}/session-key`);
+  // Neither registration carried a key, only a reference to one -- and the
+  // reference is derived from the fingerprint, not chosen by the node, so no
+  // machine can name one belonging to another.
+  expect(node1.credRef).toBe(`openhands/${node1.id}/session-key`);
+  expect(node2.credRef).toBe(`openhands/${node2.id}/session-key`);
+  expect(node1.credRef).not.toBe(node2.credRef);
   expect(JSON.stringify(node1)).not.toContain(rig.keys.node1);
   expect(JSON.stringify(node2)).not.toContain(rig.keys.node2);
 });
@@ -707,7 +711,9 @@ test("re-enrolling updates in place and never escalates trust", async ({
     "tests/e2e/live/fleet-registry/rig.mjs",
     "reenrol-node1",
   ]);
-  expect(reEnrolNode2()).toMatch(/^active /);
+  // `enrol` also prints where the session key must live, so the state line is
+  // matched rather than assumed to be first.
+  expect(reEnrolNode2()).toMatch(/^active \S+$/m);
 
   const after = await listEntries(request);
   expect(after, "re-enrolment must never add a second entry").toHaveLength(2);
