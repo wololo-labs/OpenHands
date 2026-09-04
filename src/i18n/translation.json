@@ -14126,7 +14126,6 @@
     "uk": "Повідомлено користувацькі метадані завдання.",
     "ca": "S'han informat metadades personalitzades de la tasca."
   },
-
   "AUTOMATIONS$DETAIL$VIEW_CONVERSATION_FOR_RUN": {
     "en": "View conversation for run at {{timestamp}}",
     "ja": "{{timestamp}} の実行の会話を表示",
@@ -41666,5 +41665,39 @@
     "de": "Die Flottenregistrierung ist nicht erreichbar. Es wird die zwischengespeicherte Liste angezeigt.",
     "uk": "Реєстр флоту недоступний. Показано кешований список.",
     "ca": "No es pot accedir al registre de la flota. Es mostra la llista en memòria cau."
+  },
+  "BACKEND$APPROVE_FAILED": {
+    "en": "Could not approve this backend. The fleet registry did not accept the change.",
+    "ja": "このバックエンドを承認できませんでした。フリートレジストリが変更を受け付けませんでした。",
+    "zh-CN": "无法批准此后端。机群注册表未接受该更改。",
+    "zh-TW": "無法核准此後端。機群註冊表未接受該變更。",
+    "ko-KR": "이 백엔드를 승인하지 못했습니다. 플릿 레지스트리가 변경을 수락하지 않았습니다.",
+    "no": "Kunne ikke godkjenne denne bakenden. Flåteregisteret godtok ikke endringen.",
+    "it": "Impossibile approvare questo backend. Il registro della flotta non ha accettato la modifica.",
+    "pt": "Não foi possível aprovar este backend. O registro da frota não aceitou a alteração.",
+    "es": "No se pudo aprobar este backend. El registro de la flota no aceptó el cambio.",
+    "ar": "تعذر اعتماد هذه الواجهة الخلفية. لم يقبل سجل الأسطول التغيير.",
+    "fr": "Impossible d'approuver ce backend. Le registre de la flotte n'a pas accepté la modification.",
+    "tr": "Bu arka uç onaylanamadı. Filo kaydı değişikliği kabul etmedi.",
+    "de": "Dieses Backend konnte nicht genehmigt werden. Die Flottenregistrierung hat die Änderung nicht akzeptiert.",
+    "uk": "Не вдалося схвалити цей бекенд. Реєстр флоту не прийняв зміну.",
+    "ca": "No s'ha pogut aprovar aquest backend. El registre de la flota no ha acceptat el canvi."
+  },
+  "BACKEND$REVOKE_FAILED": {
+    "en": "Could not revoke this backend. It may still be reachable — try again.",
+    "ja": "このバックエンドを取り消せませんでした。まだ接続可能な可能性があります。再試行してください。",
+    "zh-CN": "无法吊销此后端。它可能仍然可以访问，请重试。",
+    "zh-TW": "無法撤銷此後端。它可能仍可存取，請重試。",
+    "ko-KR": "이 백엔드를 취소하지 못했습니다. 아직 연결 가능할 수 있으니 다시 시도하세요.",
+    "no": "Kunne ikke tilbakekalle denne bakenden. Den kan fortsatt være tilgjengelig — prøv igjen.",
+    "it": "Impossibile revocare questo backend. Potrebbe essere ancora raggiungibile: riprova.",
+    "pt": "Não foi possível revogar este backend. Ele ainda pode estar acessível — tente novamente.",
+    "es": "No se pudo revocar este backend. Puede seguir siendo accesible: inténtalo de nuevo.",
+    "ar": "تعذر إبطال هذه الواجهة الخلفية. قد تظل قابلة للوصول — أعد المحاولة.",
+    "fr": "Impossible de révoquer ce backend. Il peut rester accessible — réessayez.",
+    "tr": "Bu arka uç iptal edilemedi. Hâlâ erişilebilir olabilir — yeniden deneyin.",
+    "de": "Dieses Backend konnte nicht widerrufen werden. Es ist möglicherweise weiterhin erreichbar – bitte erneut versuchen.",
+    "uk": "Не вдалося відкликати цей бекенд. Він може бути досі доступним — спробуйте ще раз.",
+    "ca": "No s'ha pogut revocar aquest backend. Encara pot ser accessible: torna-ho a provar."
   }
 }
