@@ -59,9 +59,18 @@ function buildNoBackendPrefix() {
   return <BackendStatusDot isConnected="unavailable" />;
 }
 
+/**
+ * A fleet backend that has not been approved is listed but not connectable:
+ * a signature proves a host owns its key, never that it may be reached.
+ */
+function isAwaitingApproval(backend: Backend): boolean {
+  return backend.registryState === "pending";
+}
+
 function buildOptions(
   registered: Backend[],
   personalWorkspaceLabel: string,
+  pendingApprovalLabel: string,
   cloudOrgs: ReturnType<typeof useAllCloudOrganizations>,
   currentUserIds: ReturnType<typeof useCloudCurrentUserId>,
   healthByBackendId: Record<string, BackendHealth>,
@@ -72,10 +81,12 @@ function buildOptions(
   const clouds = registered.filter((b) => b.kind === "cloud");
 
   for (const b of locals) {
+    const awaitingApproval = isAwaitingApproval(b);
     options.push({
       value: makeOptionValue(b.id, null),
-      label: b.name,
+      label: awaitingApproval ? `${b.name} (${pendingApprovalLabel})` : b.name,
       prefix: buildStatusPrefix(healthByBackendId[b.id]),
+      disabled: awaitingApproval,
     });
   }
 
@@ -164,12 +175,14 @@ export function BackendSelector({
     React.useState(false);
 
   const personalWorkspaceLabel = t(I18nKey.BACKEND$PERSONAL_WORKSPACE);
+  const pendingApprovalLabel = t(I18nKey.BACKEND$TRUST_PENDING);
 
   const options = React.useMemo(
     () =>
       buildOptions(
         backends,
         personalWorkspaceLabel,
+        pendingApprovalLabel,
         cloudOrgs,
         currentUserIds,
         healthByBackendId,
@@ -177,6 +190,7 @@ export function BackendSelector({
     [
       backends,
       personalWorkspaceLabel,
+      pendingApprovalLabel,
       cloudOrgs,
       currentUserIds,
       healthByBackendId,
@@ -351,6 +365,8 @@ export function BackendSelector({
       const { backendId, orgId } = parseOptionValue(value);
       const target = backends.find((b) => b.id === backendId);
       if (!target) return;
+      // @spec FR-012 - a pending fleet entry is not connectable
+      if (isAwaitingApproval(target)) return;
 
       triggerEnvironmentSwitch(
         options.find((option) => option.value === value)?.label ?? target.name,

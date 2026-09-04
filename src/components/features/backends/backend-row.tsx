@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import { Pencil, RefreshCw, Trash2 } from "lucide-react";
+import { Ban, Check, Pencil, RefreshCw, Trash2 } from "lucide-react";
 
 import { type Backend } from "#/api/backend-registry/types";
 import {
@@ -26,6 +26,10 @@ interface BackendRowProps {
   onEdit: () => void;
   onRemove: () => void;
   onLogin?: (apiKey: string) => void;
+  /** Present only for a fleet entry still waiting for approval. */
+  onApprove?: () => void;
+  /** Present only for a fleet entry that has already been approved. */
+  onRevoke?: () => void;
 }
 
 export function BackendRow({
@@ -36,8 +40,15 @@ export function BackendRow({
   onEdit,
   onRemove,
   onLogin,
+  onApprove,
+  onRevoke,
 }: BackendRowProps) {
   const { t } = useTranslation("openhands");
+  // Fleet entries are owned by the registry, so editing or deleting the
+  // browser's copy would be undone by the next hydration. Revoking is the
+  // action that actually removes one.
+  const isFleetEntry = backend.provenance === "registry";
+  const isAwaitingApproval = backend.registryState === "pending";
   const isInvalidApiKey = isInvalidBackendApiKeyHealthError(health?.lastError);
   const isCloudLoggedOut =
     backend.kind === "cloud" &&
@@ -59,7 +70,8 @@ export function BackendRow({
         ? "text-red-300"
         : "text-[var(--oh-muted)]";
   const dotStatus = isInvalidApiKey ? false : (health?.isConnected ?? null);
-  const canSelect = health?.isConnected === true && !isInvalidApiKey;
+  const canSelect =
+    health?.isConnected === true && !isInvalidApiKey && !isAwaitingApproval;
   const lockedCloudHost = getLockedCloudHost();
 
   return (
@@ -94,6 +106,18 @@ export function BackendRow({
           ) : null}
           <span className="truncate text-xs text-[var(--oh-muted)]">
             {backend.host}
+          </span>
+          <span
+            data-testid={`manage-backends-provenance-${backend.name}`}
+            className="truncate text-xs text-[var(--oh-text-tertiary)]"
+          >
+            {isFleetEntry
+              ? t(
+                  isAwaitingApproval
+                    ? I18nKey.BACKEND$TRUST_PENDING
+                    : I18nKey.BACKEND$PROVENANCE_REGISTRY,
+                )
+              : t(I18nKey.BACKEND$PROVENANCE_MANUAL)}
           </span>
           <span
             data-testid={`manage-backends-status-${backend.name}`}
@@ -134,7 +158,29 @@ export function BackendRow({
             analyticsSource="manage_backends_modal"
           />
         ) : null}
-        {!lockedCloudHost && (
+        {onApprove ? (
+          <button
+            type="button"
+            onClick={onApprove}
+            aria-label={t(I18nKey.BACKEND$APPROVE)}
+            data-testid={`manage-backends-approve-${backend.name}`}
+            className={ROW_ACTION_BUTTON_CLASS}
+          >
+            <Check aria-hidden className="size-4" strokeWidth={2} />
+          </button>
+        ) : null}
+        {onRevoke ? (
+          <button
+            type="button"
+            onClick={onRevoke}
+            aria-label={t(I18nKey.BACKEND$REVOKE)}
+            data-testid={`manage-backends-revoke-${backend.name}`}
+            className={ROW_ACTION_BUTTON_CLASS}
+          >
+            <Ban aria-hidden className="size-4" strokeWidth={2} />
+          </button>
+        ) : null}
+        {!lockedCloudHost && !isFleetEntry && (
           <button
             type="button"
             onClick={onEdit}
@@ -145,7 +191,7 @@ export function BackendRow({
             <Pencil aria-hidden className="size-4" strokeWidth={2} />
           </button>
         )}
-        {!lockedCloudHost && (
+        {!lockedCloudHost && !isFleetEntry && (
           <button
             type="button"
             onClick={onRemove}

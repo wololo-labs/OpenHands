@@ -7,7 +7,9 @@ import type {
   Backend,
   BackendAuthMode,
   BackendKind,
+  BackendProvenance,
   BackendSelection,
+  RegistryEntryState,
 } from "./types";
 
 export const BACKENDS_STORAGE_KEY = "openhands-backends";
@@ -19,6 +21,20 @@ function isValidKind(value: unknown): value is BackendKind {
 
 function isValidAuthMode(value: unknown): value is BackendAuthMode {
   return value === undefined || value === "api-key" || value === "cookie";
+}
+
+function isValidProvenance(value: unknown): value is BackendProvenance {
+  return value === undefined || value === "manual" || value === "registry";
+}
+
+function isValidRegistryState(value: unknown): value is RegistryEntryState {
+  return (
+    value === undefined ||
+    value === "pending" ||
+    value === "active" ||
+    value === "stale" ||
+    value === "revoked"
+  );
 }
 
 function isValidBackend(value: unknown): value is Backend {
@@ -35,7 +51,9 @@ function isValidBackend(value: unknown): value is Backend {
     (v.connectionRevision === undefined ||
       (typeof v.connectionRevision === "number" &&
         Number.isSafeInteger(v.connectionRevision) &&
-        v.connectionRevision >= 0))
+        v.connectionRevision >= 0)) &&
+    isValidProvenance(v.provenance) &&
+    isValidRegistryState(v.registryState)
   );
 }
 

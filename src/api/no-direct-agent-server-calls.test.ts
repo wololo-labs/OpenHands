@@ -8,6 +8,10 @@ const ALLOWED_AD_HOC_HTTP_FILES = new Set([
   "api/automation-service/automation-service.api.ts",
   "api/cloud/proxy.ts",
   "api/main-app-auth.ts",
+  // `/api/registry` is served in-process by this repo's own ingress
+  // (`scripts/registry/routes.mjs`), not by the agent server, so there is no
+  // typescript-client method to route it through.
+  "api/backend-registry/registry-source.ts",
 ]);
 
 function collectSourceFiles(dir: string): string[] {

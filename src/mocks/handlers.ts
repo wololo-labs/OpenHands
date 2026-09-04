@@ -28,6 +28,11 @@ import {
   CANVAS_EXTENSIONS_HANDLERS,
   resetCanvasExtensionsMockData,
 } from "./canvas-extensions-handlers";
+import {
+  REGISTRY_HANDLERS,
+  resetMockRegistryEntries,
+  seedMockRegistryEntries,
+} from "./registry-handlers";
 
 export const handlers = [
   ...FILE_SERVICE_HANDLERS,
@@ -43,6 +48,7 @@ export const handlers = [
   ...MCP_HANDLERS,
   ...WORKSPACES_HANDLERS,
   ...CANVAS_EXTENSIONS_HANDLERS,
+  ...REGISTRY_HANDLERS,
 ];
 
 export {
@@ -51,6 +57,8 @@ export {
   resetAutomationMockData,
   resetMockWorkspaces,
   resetCanvasExtensionsMockData,
+  resetMockRegistryEntries,
+  seedMockRegistryEntries,
 };
 
 export {

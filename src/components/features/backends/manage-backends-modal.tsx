@@ -3,6 +3,12 @@ import { useTranslation } from "react-i18next";
 import { Plus } from "lucide-react";
 
 import { getLockedCloudHost } from "#/api/agent-server-config";
+import {
+  approveRegistryEntry,
+  getRegistryStatus,
+  revokeRegistryEntry,
+  subscribeRegistryStatus,
+} from "#/api/backend-registry/registry-source";
 import { type Backend } from "#/api/backend-registry/types";
 import { BrandButton } from "#/components/features/settings/brand-button";
 import { ConfirmationModal } from "#/components/shared/modals/confirmation-modal";
@@ -94,6 +100,11 @@ export function ManageBackendsModal({
     null,
   );
   const [showAddForm, setShowAddForm] = React.useState(false);
+  const registryStatus = React.useSyncExternalStore(
+    subscribeRegistryStatus,
+    getRegistryStatus,
+    getRegistryStatus,
+  );
 
   const handleConfirmRemoval = () => {
     if (!pendingRemoval) return;
@@ -110,6 +121,16 @@ export function ManageBackendsModal({
     },
     [active.backend.id, active.orgId, onClose, setActive],
   );
+
+  // Approve/revoke go to the registry, not to the browser's copy: the entry
+  // is server-owned, and the list re-hydrates from the response.
+  const handleApprove = React.useCallback((backend: Backend) => {
+    void approveRegistryEntry(backend);
+  }, []);
+
+  const handleRevoke = React.useCallback((backend: Backend) => {
+    void revokeRegistryEntry(backend);
+  }, []);
 
   const handleCloudLogin = React.useCallback(
     (backend: Backend, apiKey: string) => {
@@ -154,6 +175,14 @@ export function ManageBackendsModal({
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col px-5">
+            {registryStatus === "unreachable" ? (
+              <p
+                data-testid="manage-backends-registry-unverified"
+                className="mb-2 rounded-md border border-[var(--oh-border)] px-3 py-2 text-xs text-[var(--oh-text-secondary)]"
+              >
+                {t(I18nKey.BACKEND$REGISTRY_UNVERIFIED)}
+              </p>
+            ) : null}
             <div
               className="flex-1 overflow-auto rounded-md border border-[var(--oh-border)] bg-surface-raised custom-scrollbar-always"
               data-testid="manage-backends-list"
@@ -187,6 +216,18 @@ export function ManageBackendsModal({
                         backend.authMode === "cookie"
                           ? undefined
                           : (apiKey) => handleCloudLogin(backend, apiKey)
+                      }
+                      onApprove={
+                        backend.provenance === "registry" &&
+                        backend.registryState === "pending"
+                          ? () => handleApprove(backend)
+                          : undefined
+                      }
+                      onRevoke={
+                        backend.provenance === "registry" &&
+                        backend.registryState !== "pending"
+                          ? () => handleRevoke(backend)
+                          : undefined
                       }
                     />
                   ))}

@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
 import { server } from "#/mocks/node";
+import { resetMockRegistryEntries } from "#/mocks/registry-handlers";
 import "@testing-library/jest-dom/vitest";
 
 // Some modules read env at import time before Vitest's per-test hooks run.
@@ -162,6 +163,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   server.resetHandlers();
+  resetMockRegistryEntries();
   window.sessionStorage?.removeItem("openhands-active-backend");
   // Cleanup the document body after each test
   cleanup();
@@ -189,6 +191,7 @@ afterAll(async () => {
   // Reset handlers first so no new intercepted requests start processing
   // during the drain window.
   server.resetHandlers();
+  resetMockRegistryEntries();
   for (let i = 0; i < 30; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }

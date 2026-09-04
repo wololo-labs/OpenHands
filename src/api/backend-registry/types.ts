@@ -1,6 +1,16 @@
 export type BackendKind = "local" | "cloud";
 export type BackendAuthMode = "api-key" | "cookie";
 
+/**
+ * Where a registered backend came from. Absent means the same thing as
+ * `"manual"`: entries persisted before the fleet registry existed are
+ * user-added by definition.
+ */
+export type BackendProvenance = "manual" | "registry";
+
+/** Trust state an entry carries in the fleet registry (see `scripts/registry`). */
+export type RegistryEntryState = "pending" | "active" | "stale" | "revoked";
+
 export interface Backend {
   id: string;
   name: string;
@@ -10,6 +20,10 @@ export interface Backend {
   authMode?: BackendAuthMode;
   /** Changes whenever connection credentials change, invalidating keyed data. */
   connectionRevision?: number;
+  /** Set to `"registry"` on entries hydrated from the fleet registry. */
+  provenance?: BackendProvenance;
+  /** Registry trust state; only meaningful when `provenance` is `"registry"`. */
+  registryState?: RegistryEntryState;
 }
 
 export interface BackendSelection {
