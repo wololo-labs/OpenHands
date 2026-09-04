@@ -8,6 +8,7 @@ import {
 } from "#/api/backend-registry/active-store";
 import {
   __resetRegistryStatusForTests,
+  isFleetProxyUrl,
   approveRegistryEntry,
   fetchRegistryEntries,
   getRegistryStatus,
@@ -295,5 +296,34 @@ describe("approveRegistryEntry", () => {
     stubFetch(() => new Response("", { status: 401 }));
 
     await expect(approveRegistryEntry(pending)).rejects.toThrow(/401/);
+  });
+});
+
+describe("isFleetProxyUrl", () => {
+  /**
+   * Decides whether a socket authenticates on the handshake (this origin's
+   * proxy, which must read the credential to allow the connection) or with the
+   * post-open frame everything else uses.
+   */
+  it("matches this origin's proxy paths", () => {
+    expect(isFleetProxyUrl("/backend/abc123/sockets")).toBe(true);
+    expect(
+      isFleetProxyUrl(`${window.location.origin}/backend/abc123/sockets`),
+    ).toBe(true);
+  });
+
+  it("does not match another host that happens to use the same path", () => {
+    // A manual backend pointed here is not this proxy: it expects the frame,
+    // and its URL is not somewhere this origin's key belongs.
+    expect(isFleetProxyUrl("https://elsewhere.example/backend/abc123")).toBe(
+      false,
+    );
+  });
+
+  it("does not match ordinary paths on this origin", () => {
+    expect(isFleetProxyUrl("/api/conversations")).toBe(false);
+    expect(isFleetProxyUrl("/backendish/abc")).toBe(false);
+    expect(isFleetProxyUrl(null)).toBe(false);
+    expect(isFleetProxyUrl("")).toBe(false);
   });
 });

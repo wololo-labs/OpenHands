@@ -116,10 +116,16 @@ export function backendProxyHost(entryId: string): string {
  * socket layer only ever sees the URL.
  */
 export function isFleetProxyUrl(url: string | null | undefined): boolean {
-  if (!url) return false;
+  if (!url || typeof window === "undefined") return false;
   try {
-    return new URL(url, window.location.origin).pathname.startsWith(
-      `${BACKEND_PROXY_PREFIX}/`,
+    const target = new URL(url, window.location.origin);
+    // Both halves matter. The path alone would also match a *manual* backend
+    // someone pointed at `https://elsewhere.example/backend/x`, and that host
+    // is not this proxy: it expects the post-open frame, and putting the key
+    // in its URL would write the credential into a third party's logs.
+    return (
+      target.origin === window.location.origin &&
+      target.pathname.startsWith(`${BACKEND_PROXY_PREFIX}/`)
     );
   } catch {
     return false;
