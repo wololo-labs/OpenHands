@@ -124,13 +124,43 @@ export function ManageBackendsModal({
 
   // Approve/revoke go to the registry, not to the browser's copy: the entry
   // is server-owned, and the list re-hydrates from the response.
-  const handleApprove = React.useCallback((backend: Backend) => {
-    void approveRegistryEntry(backend);
-  }, []);
+  //
+  // A failure has to be visible. Revocation is how an operator cuts a machine
+  // off; if it silently does nothing the row simply stays as it was, and they
+  // walk away believing a host was disconnected when it is still reachable.
+  const [registryError, setRegistryError] = React.useState<string | null>(null);
 
-  const handleRevoke = React.useCallback((backend: Backend) => {
-    void revokeRegistryEntry(backend);
-  }, []);
+  const runRegistryAction = React.useCallback(
+    async (action: () => Promise<void>, failureMessage: string) => {
+      setRegistryError(null);
+      try {
+        await action();
+      } catch {
+        setRegistryError(failureMessage);
+      }
+    },
+    [],
+  );
+
+  const handleApprove = React.useCallback(
+    (backend: Backend) => {
+      void runRegistryAction(
+        () => approveRegistryEntry(backend),
+        t(I18nKey.BACKEND$APPROVE_FAILED),
+      );
+    },
+    [runRegistryAction, t],
+  );
+
+  const handleRevoke = React.useCallback(
+    (backend: Backend) => {
+      void runRegistryAction(
+        () => revokeRegistryEntry(backend),
+        t(I18nKey.BACKEND$REVOKE_FAILED),
+      );
+    },
+    [runRegistryAction, t],
+  );
 
   const handleCloudLogin = React.useCallback(
     (backend: Backend, apiKey: string) => {
@@ -175,6 +205,15 @@ export function ManageBackendsModal({
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col px-5">
+            {registryError ? (
+              <p
+                data-testid="manage-backends-registry-error"
+                role="alert"
+                className="mb-2 rounded-md border border-red-500/40 px-3 py-2 text-xs text-red-300"
+              >
+                {registryError}
+              </p>
+            ) : null}
             {registryStatus === "unreachable" ? (
               <p
                 data-testid="manage-backends-registry-unverified"

@@ -103,12 +103,30 @@ export function backendProxyHost(entryId: string): string {
   return `${origin}/backend/${encodeURIComponent(entryId)}`;
 }
 
+/**
+ * The session key this origin issued us, which is also what the ingress
+ * expects on `/api/registry` and on `/backend/:id`.
+ */
+function originSessionKey(): string {
+  return makeDefaultLocalBackend()?.apiKey ?? "";
+}
+
+/**
+ * A fleet entry is reached at this origin, so it carries this origin's
+ * credential -- not the node's, which the browser never sees. The ingress
+ * checks this key to decide whether the caller may use the proxy at all, then
+ * strips it and substitutes the node's own before the request goes out.
+ *
+ * The distinction is the whole security property: what the browser holds
+ * authorises it against the master it already talks to, and buys it nothing if
+ * it leaks to a fleet machine.
+ */
 function toBackend(entry: RegistryEntry): Backend {
   return {
     id: registryBackendId(entry.id),
     name: entry.name,
     host: backendProxyHost(entry.id),
-    apiKey: "",
+    apiKey: originSessionKey(),
     kind: "local",
     provenance: "registry",
     registryState: entry.state,
@@ -118,8 +136,9 @@ function toBackend(entry: RegistryEntry): Backend {
 /**
  * Registry entries replace the previously hydrated set; manual entries are
  * kept untouched, including one that happens to point at the same host. A
- * manual entry carries a working credential and a registry entry does not, so
- * silently collapsing the two would take away a backend that works today.
+ * manual entry carries that host's own credential and reaches it directly,
+ * where a fleet entry goes through this origin's proxy, so silently collapsing
+ * the two would take away a backend that works today.
  *
  * Revoked entries are dropped rather than shown: a decommissioned host must
  * disappear from the switcher.
@@ -138,7 +157,7 @@ export function mergeRegistryEntries(
 function sessionHeaders(): Record<string, string> {
   // The registry is served by the same ingress that serves this page and
   // authenticates with the same session key the launcher baked in.
-  const apiKey = makeDefaultLocalBackend()?.apiKey;
+  const apiKey = originSessionKey();
   return apiKey ? { "X-Session-API-Key": apiKey } : {};
 }
 

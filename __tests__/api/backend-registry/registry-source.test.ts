@@ -21,6 +21,9 @@ import {
 import { BACKENDS_STORAGE_KEY } from "#/api/backend-registry/storage";
 import type { Backend } from "#/api/backend-registry/types";
 
+/** Stands in for a fleet node's real key, which must never reach the browser. */
+const NODE_SESSION_KEY = "the-fleet-nodes-own-session-key";
+
 const MANUAL_BACKEND: Backend = {
   id: "manual-1",
   name: "My laptop",
@@ -90,10 +93,20 @@ describe("mergeRegistryEntries", () => {
     });
   });
 
-  it("hands the browser no credential for a fleet entry", () => {
+  /**
+   * A fleet entry carries *this origin's* key, which the browser already holds
+   * and which the ingress requires before it will use the proxy at all. What
+   * it must never carry is the node's own key: that one stays server-side and
+   * is substituted on the way out.
+   *
+   * @spec FR-019
+   */
+  it("hands the browser this origin's credential, never the node's", () => {
     const [hydrated] = mergeRegistryEntries([], [entry()]);
 
-    expect(hydrated.apiKey).toBe("");
+    expect(hydrated.apiKey).toBe("launcher-key");
+    expect(hydrated.apiKey).not.toBe(NODE_SESSION_KEY);
+    expect(JSON.stringify(hydrated)).not.toContain(NODE_SESSION_KEY);
   });
 
   it("routes a fleet entry through the injecting proxy, not the node itself", () => {
