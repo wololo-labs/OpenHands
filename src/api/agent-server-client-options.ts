@@ -39,14 +39,38 @@ function normalizeHost(host: string): string {
   return host.replace(/\/+$/, "");
 }
 
-function resolveHost(
+/**
+ * Resolves the host and the credential *together*, from the same source.
+ *
+ * A call that names its own host carries its own key or none at all; only a
+ * call that falls back to the active backend for its host falls back to that
+ * backend for its key. Resolving the two independently is a credential leak:
+ * an override of `{ host, sessionApiKey: null }` means "this host has no key",
+ * and `??` reads that `null` as "unspecified", so the active backend's key
+ * would be sent to a host it does not belong to. A manual backend with a blank
+ * key is exactly that shape, and so is any call naming a conversation runtime
+ * alongside the key for it.
+ */
+function resolveTarget(
   overrides: AgentServerClientOverrides,
   backend: Backend | null,
-): string {
-  if (overrides.host) return normalizeHost(overrides.host);
-  if (overrides.conversationUrl)
-    return normalizeHost(buildHttpBaseUrl(overrides.conversationUrl));
-  return normalizeHost(backend?.host ?? "");
+): { host: string; apiKey: string | undefined } {
+  const overriddenKey =
+    overrides.sessionApiKey ?? overrides.apiKey ?? undefined;
+
+  if (overrides.host) {
+    return { host: normalizeHost(overrides.host), apiKey: overriddenKey };
+  }
+  if (overrides.conversationUrl) {
+    return {
+      host: normalizeHost(buildHttpBaseUrl(overrides.conversationUrl)),
+      apiKey: overriddenKey,
+    };
+  }
+  return {
+    host: normalizeHost(backend?.host ?? ""),
+    apiKey: overriddenKey ?? backend?.apiKey ?? undefined,
+  };
 }
 
 export function getAgentServerClientOptions(
@@ -57,11 +81,10 @@ export function getAgentServerClientOptions(
     throw new NoBackendAvailableError();
   }
 
-  const apiKey =
-    overrides.sessionApiKey ?? overrides.apiKey ?? backend?.apiKey ?? undefined;
+  const { host, apiKey } = resolveTarget(overrides, backend);
 
   return {
-    host: resolveHost(overrides, backend),
+    host,
     ...(apiKey ? { apiKey } : {}),
     workingDir: overrides.workingDir ?? getAgentServerWorkingDir(),
     ...(overrides.timeout !== undefined ? { timeout: overrides.timeout } : {}),

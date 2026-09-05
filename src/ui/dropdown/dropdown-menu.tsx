@@ -66,6 +66,7 @@ export function DropdownMenu({
                   "focus:outline-none",
                   selectedItem?.value === option.value &&
                     "bg-[var(--oh-interactive-selected)] text-white",
+                  option.disabled && "cursor-default opacity-50",
                 ),
               })}
             >

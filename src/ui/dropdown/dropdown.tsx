@@ -98,6 +98,7 @@ export function Dropdown({
   } = useCombobox({
     items: filteredOptions,
     itemToString: (item) => item?.label ?? "",
+    isItemDisabled: (item) => item?.disabled === true,
     inputValue,
     stateReducer: (state, actionAndChanges) =>
       actionAndChanges.type === useCombobox.stateChangeTypes.InputClick &&

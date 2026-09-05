@@ -1,10 +1,20 @@
 import React from "react";
-import { sendWebSocketAuth } from "#/utils/websocket-auth";
+import {
+  resolveWebSocketAuth,
+  sendWebSocketAuth,
+} from "#/utils/websocket-auth";
 import { startHandshakeWatchdog } from "#/utils/websocket-handshake";
 
 export interface WebSocketHookOptions {
   queryParams?: Record<string, string | boolean>;
   sessionApiKey?: string | null;
+  /**
+   * The backend URL this socket belongs to. Used only to decide how the
+   * credential is presented -- see `resolveWebSocketAuth`, which moves the key
+   * onto the handshake for a socket reaching a fleet backend through this
+   * origin's proxy.
+   */
+  conversationUrl?: string | null;
   onOpen?: (event: Event) => void;
   onClose?: (event: CloseEvent) => void;
   onMessage?: (event: MessageEvent) => void;
@@ -39,9 +49,11 @@ export const useWebSocket = (url: string, options?: WebSocketHookOptions) => {
   const connectWebSocket = React.useCallback(() => {
     // Build URL with query parameters if provided
     let wsUrl = url;
-    if (optionsRef.current?.queryParams) {
+    // Key count, not truthiness: an empty `queryParams` must not append a
+    // bare `?` to the handshake URL.
+    if (Object.keys(optionsRef.current?.queryParams ?? {}).length > 0) {
       const stringParams = Object.entries(
-        optionsRef.current.queryParams,
+        optionsRef.current?.queryParams ?? {},
       ).reduce(
         (acc, [key, value]) => {
           acc[key] = String(value);
@@ -52,6 +64,13 @@ export const useWebSocket = (url: string, options?: WebSocketHookOptions) => {
       const params = new URLSearchParams(stringParams);
       wsUrl = `${url}?${params.toString()}`;
     }
+
+    const auth = resolveWebSocketAuth(
+      wsUrl,
+      optionsRef.current?.conversationUrl,
+      optionsRef.current?.sessionApiKey,
+    );
+    wsUrl = auth.url;
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -65,7 +84,9 @@ export const useWebSocket = (url: string, options?: WebSocketHookOptions) => {
 
     ws.onopen = (event) => {
       cancelHandshakeWatchdog();
-      sendWebSocketAuth(ws, optionsRef.current?.sessionApiKey);
+      if (auth.sendFrame) {
+        sendWebSocketAuth(ws, optionsRef.current?.sessionApiKey);
+      }
       setIsConnected(true);
       setError(null); // Clear any previous errors
       setIsReconnecting(false);

@@ -1004,6 +1004,9 @@ export function ConversationWebSocketProvider({
     return {
       queryParams,
       sessionApiKey,
+      // Decides how the credential is presented: a fleet conversation is
+      // reached through this origin's proxy, which reads it on the handshake.
+      conversationUrl,
       reconnect: { enabled: true },
       onOpen: () => {
         setMainConnectionState("OPEN");
@@ -1027,6 +1030,7 @@ export function ConversationWebSocketProvider({
     setErrorMessage,
     clearConnectionError,
     sessionApiKey,
+    conversationUrl,
     initialAfterTimestamp,
   ]);
 
@@ -1043,6 +1047,7 @@ export function ConversationWebSocketProvider({
     return {
       queryParams,
       sessionApiKey: planningApiKey,
+      conversationUrl: planningAgentConversation?.conversation_url,
       reconnect: { enabled: true },
       onOpen: async () => {
         setPlanningConnectionState("OPEN");

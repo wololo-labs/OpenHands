@@ -14,6 +14,7 @@ import {
   dropBackendHealth,
   resetBackendHealth,
 } from "#/api/backend-registry/health-store";
+import { startRegistryHydration } from "#/api/backend-registry/registry-source";
 import {
   type Backend,
   type BackendSelection,
@@ -78,6 +79,12 @@ export function ActiveBackendProvider({
     getSnapshot,
     getSnapshot,
   );
+
+  // The fleet registry, when this deployment serves one, is the source of
+  // truth for the backend list; `localStorage` is only a cache so an offline
+  // browser still opens. Hydration stops polling by itself when there is no
+  // registry, which is the default.
+  React.useEffect(() => startRegistryHydration(), []);
 
   const retryBootstrapProbe = React.useCallback(() => {
     clearCachedAgentServerInfo();

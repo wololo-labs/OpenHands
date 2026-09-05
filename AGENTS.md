@@ -461,6 +461,60 @@ if (getActiveBackend().backend.kind === "cloud") {
 return new ConversationClient(getAgentServerClientOptions()).someMethod(...);
 ```
 
+### Exception -- routes this repo serves itself
+
+`/api/registry/*` and `/backend/:id/*` are served in-process by this repo's own
+ingress (`scripts/registry/routes.mjs`, `scripts/proxy-backend.mjs`), not by the
+agent server, so there is no typescript-client method to route them through.
+`src/api/backend-registry/registry-source.ts` is allow-listed in the CI guard for
+exactly that reason. Do not extend the allow-list for anything the agent server
+actually serves.
+
+## Fleet Registry
+
+A server-side registry so a browser sees every agent server that exists, and a
+new machine enrols itself by signing with its own SSH host key. Off by default:
+the ingress mounts it only when a registry session key is configured, so a stack
+started the way it is today behaves exactly as it does today.
+
+- `scripts/registry/` -- entry store (`store.mjs`), storage provider
+  (`providers/inline.mjs`, backed by the agent server's
+  `misc_settings.fleet_backends`), signature verification and the approval
+  states (`enrolment.mjs`), the REST surface (`routes.mjs`), secret providers
+  (`secrets/`), and pull sources (`sources/`).
+- `scripts/proxy-backend.mjs` -- resolves a fleet entry's credential
+  server-side and injects it when proxying `/backend/:id/*`, so the browser
+  never holds a fleet key. Fails closed on an unknown, pending or revoked entry.
+- `bin/enrol.mjs` -- the enrolment client, reached as `agent-canvas enrol`. The
+  fork owns the protocol, so no other repository needs to know the payload
+  shape, the signature scheme or the endpoint.
+- `src/api/backend-registry/registry-source.ts` -- hydrates the switcher from
+  `GET /api/registry`, demoting `localStorage` to a cache.
+- Requirements are numbered `FR-00x` in `specs/fleet-registry.md`; the operator
+  documentation is `docs/registry.md`.
+
+A signature proves possession, never authorisation: a pre-seeded fingerprint
+enrols `active`, anything else lands `pending` and cannot be selected until
+approved. `ts` in a registration is epoch **seconds**, and both ends import the
+same `canonicalPayload()` so the signed bytes cannot drift.
+
+A fleet entry carries *this origin's* session key, never the node's: the proxy
+authenticates the caller with it, then strips it and substitutes the node's own.
+`getAgentServerClientOptions()` resolves a host and its credential from the same
+source, so a call naming its own host sends that host's key or none. Never
+reintroduce a fallback to the active backend's key for a call that names a host,
+or that key travels to a host it does not belong to.
+
+The same rule applies to WebSockets, where it is easy to get wrong: a fleet
+socket authenticates on the handshake query (`handshakeAuth`) and must *not*
+also send the post-open `auth` frame, which the proxy cannot rewrite and would
+relay to the fleet machine with this origin's key in it.
+
+The unit tests all use fakes. `tests/e2e/live/fleet-registry/` is the only
+thing that exercises the loop against real machines -- `rig.mjs up`, then
+`npm run test:e2e:fleet-registry`. It needs a reachable remote host, so it is
+outside `npm test` and outside the default Playwright project.
+
 ## No Magic Strings
 
 Avoid inline string literals when they represent reusable user-facing copy or shared program identifiers. The `i18next/no-literal-string` rule is set to `"error"` for configured JSX text and attributes, and targeted `no-restricted-syntax` rules enforce shared translation and query-key patterns. Do not claim broader lint enforcement than `eslint.config.js` provides.

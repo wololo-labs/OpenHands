@@ -6,7 +6,10 @@ import type {
   BashOutput,
 } from "@openhands/typescript-client";
 import type { CommandResult } from "#/api/runtime-service/agent-server-runtime-service";
-import { sendWebSocketAuth } from "#/utils/websocket-auth";
+import {
+  resolveWebSocketAuth,
+  sendWebSocketAuth,
+} from "#/utils/websocket-auth";
 import { startHandshakeWatchdog } from "#/utils/websocket-handshake";
 import { buildBashWebSocketUrl } from "#/utils/websocket-url";
 
@@ -74,8 +77,15 @@ export function useBashCommandRunner(
   useEffect(() => {
     if (!enabled) return;
 
-    const wsUrl = buildBashWebSocketUrl(conversationUrl);
-    const ws = new WebSocket(wsUrl);
+    // Third socket in the app, and the one the first version of the fleet
+    // handshake fix missed: it reaches the same proxy as the other two and has
+    // to present its credential the same way.
+    const auth = resolveWebSocketAuth(
+      buildBashWebSocketUrl(conversationUrl),
+      conversationUrl,
+      sessionApiKey,
+    );
+    const ws = new WebSocket(auth.url);
     wsRef.current = ws;
     readyWsRef.current = null;
 
@@ -86,7 +96,9 @@ export function useBashCommandRunner(
 
     ws.onopen = () => {
       cancelHandshakeWatchdog();
-      sendWebSocketAuth(ws, sessionApiKey);
+      if (auth.sendFrame) {
+        sendWebSocketAuth(ws, sessionApiKey);
+      }
       readyWsRef.current = ws;
       for (const {
         command,

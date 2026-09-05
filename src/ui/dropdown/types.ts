@@ -9,4 +9,10 @@ export interface DropdownOption {
    * like status indicators; not searchable.
    */
   prefix?: ReactNode;
+  /**
+   * Renders the row but refuses selection (keyboard and pointer). Used for
+   * options that exist but are not connectable yet, such as a fleet backend
+   * still waiting for approval.
+   */
+  disabled?: boolean;
 }

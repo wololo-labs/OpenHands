@@ -8,7 +8,7 @@ metadata:
     {{- include "agent-canvas.labels" . | nindent 4 }}
 spec:
   serviceName: {{ $fullName }}-headless
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ if .Values.agentPool.enabled }}{{ .Values.agentPool.replicas }}{{ else }}{{ .Values.replicaCount }}{{ end }}
   podManagementPolicy: {{ .Values.statefulSet.podManagementPolicy }}
   {{- with .Values.statefulSet.updateStrategy }}
   updateStrategy:
@@ -79,6 +79,36 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.sessionApiKey.existingSecret }}
                   key: {{ .Values.secrets.sessionApiKey.key }}
+            {{- end }}
+            {{- if .Values.registry.enabled }}
+            {{- if not .Values.secrets.sessionApiKey.existingSecret }}
+            {{- fail "registry.enabled requires secrets.sessionApiKey.existingSecret: the registry authenticates with the session key, and the entrypoint's auto-generated key is not visible to the chart" }}
+            {{- end }}
+            - name: REGISTRY_SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.sessionApiKey.existingSecret }}
+                  key: {{ .Values.secrets.sessionApiKey.key }}
+            {{- with .Values.registry.preseed }}
+            - name: REGISTRY_PRESEED
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.registry.secretProvider }}
+            - name: REGISTRY_SECRET_PROVIDER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.registry.allowUncredentialed }}
+            - name: REGISTRY_ALLOW_UNCREDENTIALED
+              value: "1"
+            {{- end }}
+            {{- if .Values.registry.sources.kubernetes.enabled }}
+            - name: REGISTRY_SOURCE_KUBERNETES
+              value: "1"
+            {{- end }}
+            {{- if .Values.registry.sources.tailnet.enabled }}
+            - name: REGISTRY_SOURCE_TAILNET
+              value: "1"
+            {{- end }}
             {{- end }}
             {{- with .Values.config.extraEnv }}
             {{- toYaml . | nindent 12 }}

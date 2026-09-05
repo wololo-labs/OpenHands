@@ -3,6 +3,12 @@ import { useTranslation } from "react-i18next";
 import { Plus } from "lucide-react";
 
 import { getLockedCloudHost } from "#/api/agent-server-config";
+import {
+  approveRegistryEntry,
+  getRegistryStatus,
+  revokeRegistryEntry,
+  subscribeRegistryStatus,
+} from "#/api/backend-registry/registry-source";
 import { type Backend } from "#/api/backend-registry/types";
 import { BrandButton } from "#/components/features/settings/brand-button";
 import { ConfirmationModal } from "#/components/shared/modals/confirmation-modal";
@@ -94,6 +100,11 @@ export function ManageBackendsModal({
     null,
   );
   const [showAddForm, setShowAddForm] = React.useState(false);
+  const registryStatus = React.useSyncExternalStore(
+    subscribeRegistryStatus,
+    getRegistryStatus,
+    getRegistryStatus,
+  );
 
   const handleConfirmRemoval = () => {
     if (!pendingRemoval) return;
@@ -109,6 +120,46 @@ export function ManageBackendsModal({
       onClose();
     },
     [active.backend.id, active.orgId, onClose, setActive],
+  );
+
+  // Approve/revoke go to the registry, not to the browser's copy: the entry
+  // is server-owned, and the list re-hydrates from the response.
+  //
+  // A failure has to be visible. Revocation is how an operator cuts a machine
+  // off; if it silently does nothing the row simply stays as it was, and they
+  // walk away believing a host was disconnected when it is still reachable.
+  const [registryError, setRegistryError] = React.useState<string | null>(null);
+
+  const runRegistryAction = React.useCallback(
+    async (action: () => Promise<void>, failureMessage: string) => {
+      setRegistryError(null);
+      try {
+        await action();
+      } catch {
+        setRegistryError(failureMessage);
+      }
+    },
+    [],
+  );
+
+  const handleApprove = React.useCallback(
+    (backend: Backend) => {
+      void runRegistryAction(
+        () => approveRegistryEntry(backend),
+        t(I18nKey.BACKEND$APPROVE_FAILED),
+      );
+    },
+    [runRegistryAction, t],
+  );
+
+  const handleRevoke = React.useCallback(
+    (backend: Backend) => {
+      void runRegistryAction(
+        () => revokeRegistryEntry(backend),
+        t(I18nKey.BACKEND$REVOKE_FAILED),
+      );
+    },
+    [runRegistryAction, t],
   );
 
   const handleCloudLogin = React.useCallback(
@@ -154,6 +205,23 @@ export function ManageBackendsModal({
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col px-5">
+            {registryError ? (
+              <p
+                data-testid="manage-backends-registry-error"
+                role="alert"
+                className="mb-2 rounded-md border border-red-500/40 px-3 py-2 text-xs text-red-300"
+              >
+                {registryError}
+              </p>
+            ) : null}
+            {registryStatus === "unreachable" ? (
+              <p
+                data-testid="manage-backends-registry-unverified"
+                className="mb-2 rounded-md border border-[var(--oh-border)] px-3 py-2 text-xs text-[var(--oh-text-secondary)]"
+              >
+                {t(I18nKey.BACKEND$REGISTRY_UNVERIFIED)}
+              </p>
+            ) : null}
             <div
               className="flex-1 overflow-auto rounded-md border border-[var(--oh-border)] bg-surface-raised custom-scrollbar-always"
               data-testid="manage-backends-list"
@@ -187,6 +255,18 @@ export function ManageBackendsModal({
                         backend.authMode === "cookie"
                           ? undefined
                           : (apiKey) => handleCloudLogin(backend, apiKey)
+                      }
+                      onApprove={
+                        backend.provenance === "registry" &&
+                        backend.registryState === "pending"
+                          ? () => handleApprove(backend)
+                          : undefined
+                      }
+                      onRevoke={
+                        backend.provenance === "registry" &&
+                        backend.registryState !== "pending"
+                          ? () => handleRevoke(backend)
+                          : undefined
                       }
                     />
                   ))}

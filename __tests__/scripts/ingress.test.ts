@@ -2,11 +2,20 @@ import { createServer, request, type Server } from "node:http";
 import { connect as netConnect, type AddressInfo, type Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import { spawn, type ChildProcess } from "node:child_process";
+import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { once } from "node:events";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, beforeAll, afterAll, afterEach } from "vitest";
+
+import { http, passthrough } from "msw";
+
+import { server as mswServer } from "#/mocks/node";
+import {
+  canonicalPayload,
+  fingerprintFromPublicKey,
+} from "../../scripts/registry/enrolment.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -806,5 +815,177 @@ describe("ingress --no-referrer-prefix", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("referrer-policy")).toBeNull();
+  });
+});
+
+describe("ingress fleet registry", () => {
+  let agentServer: Server;
+  let ingressProcess: ChildProcess | undefined;
+  let ingressPort: number;
+  let settingsWrites: unknown[];
+  let miscSettings: Record<string, unknown>;
+
+  function sshPublicKeyLine(publicKey: KeyObject) {
+    // SPKI DER for Ed25519 is a 12-byte header followed by the raw key bytes.
+    const raw = publicKey.export({ format: "der", type: "spki" }).subarray(12);
+    const type = Buffer.from("ssh-ed25519", "utf8");
+    const blob = Buffer.concat([
+      Buffer.from([0, 0, 0, type.length]),
+      type,
+      Buffer.from([0, 0, 0, raw.length]),
+      raw,
+    ]);
+    return `ssh-ed25519 ${blob.toString("base64")} test@fixture`;
+  }
+
+  async function startIngressProcess(extraArgs: string[]) {
+    ingressPort = await getFreePort();
+    ingressProcess = spawn(
+      process.execPath,
+      [
+        ingressScript,
+        "--port",
+        ingressPort.toString(),
+        "--route",
+        `/api=${originForPort(serverPort(agentServer))}`,
+        ...extraArgs,
+      ],
+      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    await waitForPort(ingressPort, ingressProcess);
+    // The suite-wide MSW handlers answer `*/api/registry` on any origin, which
+    // would reply for the spawned ingress too. Let its origin through so these
+    // assertions see what the ingress actually served.
+    mswServer.use(
+      http.all(`${originForPort(ingressPort)}/*`, () => passthrough()),
+    );
+  }
+
+  beforeAll(async () => {
+    settingsWrites = [];
+    miscSettings = { app_preferences: { language: "en" } };
+    agentServer = createServer((req, res) => {
+      void (async () => {
+        if (req.url !== "/api/settings") {
+          res.writeHead(404).end("agent server: not found");
+          return;
+        }
+        if (req.method === "PATCH") {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(chunk as Buffer);
+          const diff =
+            JSON.parse(Buffer.concat(chunks).toString("utf8"))
+              .misc_settings_diff ?? {};
+          settingsWrites.push(diff);
+          miscSettings = { ...miscSettings, ...diff };
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ misc_settings: miscSettings }));
+      })();
+    });
+    await listenOnLoopback(agentServer);
+  });
+
+  afterEach(async () => {
+    await stopChild(ingressProcess);
+    ingressProcess = undefined;
+  });
+
+  afterAll(async () => {
+    await closeServer(agentServer);
+  });
+
+  it("proxies /api/registry to the backend when the registry is disabled", async () => {
+    await startIngressProcess([]);
+
+    const response = await fetch(`${originForPort(ingressPort)}/api/registry`);
+
+    // The agent server has no such route, so a 404 from it proves the ingress
+    // did not start serving the path itself.
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("agent server: not found");
+  });
+
+  it("serves the registry in-process once a session key is configured", async () => {
+    await startIngressProcess(["--registry-session-key", "ingress-test-key"]);
+    const origin = originForPort(ingressPort);
+
+    const unauthorized = await fetch(`${origin}/api/registry`);
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).toMatchObject({ error: "unauthorized" });
+
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const body = {
+      name: "hetzner",
+      host: "https://claude-hetzner.example.ts.net:8443",
+      pubkey: sshPublicKeyLine(publicKey),
+      credRef: "openhands/hetzner/session-key",
+      version: "1.44.0",
+      nonce: "ingress-nonce-1",
+      ts: Math.floor(Date.now() / 1000),
+    };
+    const registered = await fetch(`${origin}/api/registry/register`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Registry-Signature": sign(
+          null,
+          Buffer.from(canonicalPayload(body), "utf8"),
+          privateKey,
+        ).toString("base64"),
+      },
+      body: JSON.stringify(body),
+    });
+
+    expect(registered.status).toBe(201);
+    expect(await registered.json()).toMatchObject({ state: "pending" });
+    expect(settingsWrites.at(-1)).toMatchObject({
+      fleet_backends: { entries: [{ name: "hetzner", state: "pending" }] },
+    });
+
+    const listed = await fetch(`${origin}/api/registry`, {
+      headers: { "X-Session-API-Key": "ingress-test-key" },
+    });
+    expect(listed.status).toBe(200);
+    expect(await listed.json()).toMatchObject({
+      entries: [{ name: "hetzner", state: "pending" }],
+    });
+  });
+
+  it("auto-approves a pre-seeded fingerprint", async () => {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const pubkey = sshPublicKeyLine(publicKey);
+    await startIngressProcess([
+      "--registry-session-key",
+      "ingress-test-key",
+      "--registry-preseed",
+      `${fingerprintFromPublicKey(pubkey)},SHA256:someOtherHost`,
+    ]);
+
+    const body = {
+      name: "preseeded",
+      host: "https://preseeded.example.ts.net:8443",
+      pubkey,
+      nonce: "ingress-nonce-2",
+      ts: Math.floor(Date.now() / 1000),
+    };
+    const registered = await fetch(
+      `${originForPort(ingressPort)}/api/registry/register`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Registry-Signature": sign(
+            null,
+            Buffer.from(canonicalPayload(body), "utf8"),
+            privateKey,
+          ).toString("base64"),
+        },
+        body: JSON.stringify(body),
+      },
+    );
+
+    expect(registered.status).toBe(201);
+    expect(await registered.json()).toMatchObject({ state: "active" });
   });
 });
