@@ -2,7 +2,7 @@
  * 1Password secret provider, via the installed `op` CLI.
  *
  * A reference maps to an `op://` secret reference. `openhands/<entry id>/session-key`
- * becomes `op://<vault>/openhands_hetzner_session-key/password`, so the vault
+ * becomes `op://<vault>/openhands_<entry id>_session-key/password`, so the vault
  * is chosen by configuration rather than encoded in every registry entry.
  *
  * The CLI is spawned with an argument array and never through a shell, so a
@@ -20,7 +20,7 @@ const execFileAsync = promisify(execFile);
 export const DEFAULT_ONEPASSWORD_VAULT = "openhands";
 const FIELD = "password";
 
-/** `openhands/<entry id>/session-key` -> `op://<vault>/openhands_hetzner_session-key/password` */
+/** `openhands/<entry id>/session-key` -> `op://<vault>/openhands_<entry id>_session-key/password` */
 export function toOpReference(ref, vault = DEFAULT_ONEPASSWORD_VAULT) {
   const item = assertValidSecretRef(ref).replace(/\//g, "_");
   return `op://${vault}/${item}/${FIELD}`;
