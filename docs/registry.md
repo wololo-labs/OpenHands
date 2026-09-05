@@ -104,10 +104,14 @@ the whole of it. An entry that already exists skips the pending cap, so with a
 shared bound one enrolled keypair could re-register with fresh nonces until
 the table was full and every other machine's enrolment answered "too many in
 flight". Per identity, a flood spends the flooder's own budget and earns a
-`429` that names them. A slot is spent only once the entry has been written,
-so no refusal holds one and neither does a registration that is merely in
-flight -- a cap refusal, a malformed body and an unreachable agent server all
-leave the table as they found it. Charging a refusal would read as making a
+`429` that names them. The slot is taken inside the store's lock, atomically
+with the decision it protects, and last: no refusal holds one, and neither
+does a registration that is merely queued. Checking before the lock and
+recording after it looks equivalent and is not -- a batch arriving together
+all found the table empty, all queued, and all wrote, so one keypair with one
+nonce bought a settings write per request. The check outside the lock stays,
+as a filter that keeps sequential replays from queueing at all, never as the
+guarantee. Charging a refusal would read as making a
 flood pay and do the reverse: the flooder spends a throwaway keypair per
 attempt, while the slots come out of a table the whole fleet shares.
 

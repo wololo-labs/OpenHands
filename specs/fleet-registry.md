@@ -48,8 +48,12 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
       pending cap, so one enrolled keypair could spend nonces until the shared
       table was full and every other machine's enrolment was refused.
 
-- [x] A nonce slot shall be spent only once the entry has been written, so no
-      refused registration holds one, and neither does one still in flight.
+- [x] A nonce shall be recorded inside the store's lock, atomically with the
+      write it protects, and last: no refused registration shall hold a slot,
+      and neither shall one still queued. Recorded outside the lock, a batch
+      arriving together all pass the check and all write, so the budget binds
+      only sequential traffic and one nonce buys as many writes as there are
+      concurrent requests.
       Charging a refusal reads as making a flood pay and does the reverse,
       because the flooder spends a throwaway keypair per attempt while the
       slots come out of a table the whole fleet shares.

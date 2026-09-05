@@ -144,7 +144,11 @@ describe("registry routes", () => {
   /** Mounts a registry the way scripts/ingress.mjs does. */
   async function mountRegistry(
     preSeededFingerprints: string[] = [],
-    limits: { maxEntries?: number; maxPendingEntries?: number } = {},
+    limits: {
+      maxEntries?: number;
+      maxPendingEntries?: number;
+      maxNoncesPerFingerprint?: number;
+    } = {},
   ) {
     const registry = createRegistry({
       agentServerUrl,
@@ -633,6 +637,42 @@ describe("registry routes", () => {
         expect(removed.status).toBe(200);
         expect(stored).toBeNull();
       }
+    });
+
+    it("holds one key's nonce budget against a burst", async () => {
+      // The budget was checked before the lock and recorded after it, so a
+      // batch arriving together all found the table empty and all wrote.
+      // Nothing caps them once the entry exists -- a machine already listed
+      // always gets through -- so one keypair bought a settings write per
+      // request, all of them serialised through the lock the rest of the
+      // registry needs.
+      const registry = await mountRegistry([], { maxNoncesPerFingerprint: 3 });
+      const { pubkey, privateKey } = makeHostKey();
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 40 }, (_, index) =>
+          enrol(registry, pubkey, privateKey, { nonce: `n${index}` }),
+        ),
+      );
+
+      const accepted = results.filter((r) => r.status === "fulfilled").length;
+      expect(accepted).toBeLessThanOrEqual(3);
+      expect(accepted).toBeGreaterThan(0);
+    });
+
+    it("lets one nonce buy exactly one write, however many arrive at once", async () => {
+      const registry = await mountRegistry();
+      const { pubkey, privateKey } = makeHostKey();
+      agentServer.reads.length = 0;
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 20 }, () =>
+          enrol(registry, pubkey, privateKey, { nonce: "one" }),
+        ),
+      );
+
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      expect(agentServer.reads.filter((m) => m === "PATCH")).toHaveLength(1);
     });
 
     it("holds the entry cap against a burst", async () => {

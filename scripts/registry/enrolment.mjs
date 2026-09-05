@@ -384,6 +384,17 @@ export function createEnrolment({
    * the write, and a duplicate arriving in parallel must not turn an entry
    * that was stored into an error.
    */
+  /** Hands a slot back when the write it was taken for never happened. */
+  function releaseNonce(fingerprint, nonce) {
+    if (!seenNonces.delete(`${fingerprint}:${nonce}`)) return;
+    const remaining = (nonceCounts.get(fingerprint) ?? 1) - 1;
+    if (remaining > 0) {
+      nonceCounts.set(fingerprint, remaining);
+    } else {
+      nonceCounts.delete(fingerprint);
+    }
+  }
+
   function spendNonce(fingerprint, nonce, nowMs) {
     const key = `${fingerprint}:${nonce}`;
     if (seenNonces.has(key)) return;
@@ -424,8 +435,11 @@ export function createEnrolment({
       const isPreSeeded = preSeeded.has(fingerprint);
       const id = entryId(fingerprint);
 
-      // Before the store is touched. A caller over its budget, or replaying,
-      // is turned away for a Map lookup rather than a settings fetch.
+      // A cheap pre-filter, not the guarantee: a caller that is already over
+      // its budget, or replaying something already recorded, is turned away
+      // for a Map lookup rather than a settings fetch. The check that counts
+      // runs under the lock, where nothing can interleave between it and the
+      // write it is protecting.
       checkNonce(fingerprint, nonce, nowMs);
       // Normalised here rather than left to the store, because the state
       // machine below compares it against what is already stored and a
@@ -452,15 +466,24 @@ export function createEnrolment({
       });
 
       let created = false;
+      let spent = false;
       // The trust decision is made against the entry as it is at the moment
       // of writing, rather than against a copy read beforehand. Deciding
-      // outside the
-      // lock let a registration already in flight overwrite an operator's
-      // revoke with a `state` computed before it: revocation did not stick
-      // against a machine that was still re-registering, which is the one
-      // machine it has to stick against.
-      const entry = await store.mutate(id, (current, entries) => {
+      // outside the lock let a registration already in flight overwrite an
+      // operator's revoke with a `state` computed before it: revocation did
+      // not stick against a machine that was still re-registering, which is
+      // the one machine it has to stick against.
+      const write = store.mutate(id, (current, entries) => {
         created = current === null;
+
+        // The reservation has to be taken here, atomically with the decision
+        // it protects. Checked before the lock and recorded after it, a batch
+        // arriving together all found the table empty, all queued, and all
+        // wrote: an existing entry skips the caps, so one keypair with one
+        // nonce bought a thousand settings writes and the per-fingerprint
+        // budget was enforceable only against traffic that arrived one at a
+        // time.
+        checkNonce(fingerprint, nonce, nowMs);
 
         // Capped here rather than before the write, for the same reason the
         // trust decision is: a count read beforehand is a count a burst
@@ -493,6 +516,14 @@ export function createEnrolment({
           }
         }
 
+        // Last, so that nothing a refusal reaches has spent anything: the
+        // slot comes out of a table the whole fleet shares, and a flood
+        // spends a throwaway keypair per attempt, so charging it for being
+        // refused costs the flooder nothing and denies enrolment to everyone
+        // else.
+        spendNonce(fingerprint, nonce, nowMs);
+        spent = true;
+
         return {
           id,
           name: body.name,
@@ -506,14 +537,17 @@ export function createEnrolment({
         };
       });
 
-      // Spent only once the write has happened, so nothing that is merely in
-      // flight holds one. The slot comes out of a table the whole fleet
-      // shares, and a flood spends a throwaway keypair per attempt: charging
-      // for a refusal, or holding a slot for the length of a queued write,
-      // costs the flooder nothing and fills the table for everyone else. What
-      // can be held at once is now bounded by the entry cap, because only an
-      // entry that exists can have spent anything.
-      spendNonce(fingerprint, nonce, nowMs);
+      let entry;
+      try {
+        entry = await write;
+      } catch (error) {
+        // The reservation was taken and the write then failed, so it was
+        // never really used. Keeping it would let an agent-server outage burn
+        // a node's budget and lock it out of re-enrolling for the rest of the
+        // window, exactly when re-enrolling matters.
+        if (spent) releaseNonce(fingerprint, nonce);
+        throw error;
+      }
 
       return { entry, created };
     },
