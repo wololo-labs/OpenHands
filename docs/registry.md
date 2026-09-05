@@ -70,6 +70,7 @@ decision:
 | Entry revoked, then the node re-registers        | Stays `revoked`; re-registering never restores trust |
 | Entry approved, then un-seeded                   | Stays `active`; the approval already happened        |
 | Hand-approved entry re-registers on a new host   | Back to `pending`; the address was part of the approval |
+| Entry deleted with `DELETE /api/registry/:id`    | Forgotten entirely; revoke keeps it, delete does not  |
 | Pre-seeded entry re-registers on a new host      | Stays `active`; the fingerprint is what was trusted   |
 | A source stops reporting a discovered machine    | `stale`, not deleted, so a revocation is never lost  |
 
@@ -78,7 +79,10 @@ does not, because a freshly provisioned node holds its own host key and none of
 the master's credentials.
 
 An approval also names the host it is approving, and is refused with `409` if
-the entry has moved since. Without that, an operator reads the queue, the entry
+the entry has moved since. The comparison happens inside the store's lock, so
+a registration already in flight cannot slip between the check and the write --
+the same reason a re-registration can no longer overwrite a revoke that has
+just landed. Without that, an operator reads the queue, the entry
 re-registers somewhere else -- still `pending`, so the row looks unchanged --
 and the click ratifies a host nobody reviewed. Manage Backends shows the
 address a fleet entry actually answers on for the same reason: its `host` is
@@ -100,9 +104,11 @@ the whole of it. An entry that already exists skips the pending cap, so with a
 shared bound one enrolled keypair could re-register with fresh nonces until
 the table was full and every other machine's enrolment answered "too many in
 flight". Per identity, a flood spends the flooder's own budget and earns a
-`429` that names them. A registration the registry then refuses costs nothing
-either: the entry is validated into its stored shape before the nonce is
-spent.
+`429` that names them. A registration refused for its *body* costs nothing --
+the entry is validated into its stored shape before the nonce is spent -- and
+one whose write then fails hands its slot back, so an agent-server outage
+cannot lock a node out of re-enrolling. Being refused by a cap does spend a
+slot, deliberately: knocking on a full queue is not free.
 
 The nonce set is process-local, so an ingress restart forgets it and a
 captured registration is replayable for the remainder of its window.

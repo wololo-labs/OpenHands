@@ -510,6 +510,12 @@ socket authenticates on the handshake query (`handshakeAuth`) and must *not*
 also send the post-open `auth` frame, which the proxy cannot rewrite and would
 relay to the fleet machine with this origin's key in it.
 
+Anything that decides on a registry entry and then writes it must do both
+inside `store.mutate`, which runs its callback under the provider's lock. A
+check made against an entry read beforehand is a race: that is how an approval
+came to ratify a host the operator never saw, and how a re-registration came to
+overwrite a revoke that had already landed.
+
 The unit tests all use fakes. `tests/e2e/live/fleet-registry/` is the only
 thing that exercises the loop against real machines -- `rig.mjs up`, then
 `npm run test:e2e:fleet-registry`. It needs a reachable remote host, so it is

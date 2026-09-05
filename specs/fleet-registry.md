@@ -13,6 +13,15 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
       session key is configured. Without it, the path shall route exactly as it
       does today.
 
+### FR-001a: The registry is bounded
+
+- [x] The number of entries, not only the number awaiting approval, shall be
+      capped. Revoking a flood's leavings frees the pending gauge but leaves
+      every entry in `misc_settings`, read in full on every registration.
+
+- [x] `DELETE /api/registry/:id` shall forget an entry outright, so junk can
+      be removed rather than only revoked.
+
 ### FR-002: Entries persist without a new datastore
 
 - [x] Registry entries shall be written through to the agent server's
@@ -36,10 +45,9 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
       pending cap, so one enrolled keypair could spend nonces until the shared
       table was full and every other machine's enrolment was refused.
 
-- [x] A registration the registry refuses shall not consume a nonce slot. The
-      entry is validated into its stored shape before the nonce is spent, so
-      every rejection reachable from a malformed body costs the caller
-      nothing.
+- [x] A registration refused for its body shall not consume a nonce slot, and
+      one whose write then fails shall hand its slot back. Being refused by a
+      cap shall consume one: knocking on a full queue is not free.
 
 ### FR-005: A signature is not an authorisation
 
@@ -67,7 +75,10 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
 ### FR-007a: An approval names what it approves
 
 - [x] `POST /api/registry/:id/approve` shall carry the host being approved and
-      shall answer `409` when the entry has since moved. Otherwise an operator
+      shall answer `409` when the entry has since moved. The comparison shall
+      happen inside the store's lock: a check made against an entry read
+      beforehand is a race, not a guarantee, because a registration already in
+      flight lands between the two. Otherwise an operator
       reads the queue, the entry re-registers elsewhere -- still `pending`, so
       the row looks unchanged -- and the approval that lands ratifies a host
       nobody reviewed.
