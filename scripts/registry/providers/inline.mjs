@@ -12,6 +12,8 @@
  * the second write would drop the first entry.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import { RegistryError } from "../store.mjs";
 
 const SETTINGS_PATH = "/api/settings";
@@ -110,25 +112,24 @@ export function createInlineProvider({
   // Serialises read-modify-write cycles. `tail` never rejects, so a failed
   // mutation does not wedge the queue for the next caller.
   let tail = Promise.resolve();
-  let held = false;
+  const insideLock = new AsyncLocalStorage();
   function withLock(fn) {
-    const run = tail.then(async () => {
-      // A nested call would wait on a lock its own caller holds, forever and
-      // silently, taking every later registry write with it.
-      if (held) {
-        throw new RegistryError(
+    // Refused at the call rather than once the lock is reached, because that
+    // is the only moment a nested call can be told apart from a merely
+    // concurrent one: both find the lock held, and only the nested one is
+    // running inside it. A nested call would otherwise wait on a lock its own
+    // caller holds -- forever, silently, taking every later registry write
+    // with it.
+    if (insideLock.getStore()) {
+      return Promise.reject(
+        new RegistryError(
           500,
           "reentrant_store_call",
           "the registry store was re-entered from inside a mutation",
-        );
-      }
-      held = true;
-      try {
-        return await fn();
-      } finally {
-        held = false;
-      }
-    });
+        ),
+      );
+    }
+    const run = tail.then(() => insideLock.run(true, fn));
     tail = run.then(
       () => undefined,
       () => undefined,

@@ -557,8 +557,7 @@ describe("registry routes", () => {
       ]);
 
       const stored = await registry.store.get(entry.id);
-      const response =
-        approval.status === "fulfilled" ? approval.value : null;
+      const response = approval.status === "fulfilled" ? approval.value : null;
 
       // The property, stated as the outcome: whichever order the two land in,
       // the entry is never `active` on an address the operator did not name.
@@ -575,6 +574,30 @@ describe("registry routes", () => {
       if (response?.status === 409) {
         expect(response.body.error).toBe("entry_changed");
       }
+    });
+
+    it("refuses a nested store call rather than deadlocking on it", async () => {
+      // A mutation that calls back into the store waits on a lock its own
+      // caller holds: forever, silently, and it wedges the queue, so every
+      // later registration, approval and revoke stops too. The guard has to
+      // fire at the call, since that is the only moment a nested call is
+      // distinguishable from a concurrent one.
+      const registry = await mountRegistry();
+      const { pubkey, privateKey } = makeHostKey();
+      const { entry } = await enrol(registry, pubkey, privateKey);
+
+      await expect(
+        registry.store.mutate(entry.id, async (current: unknown) => {
+          await registry.store.setState(entry.id, "revoked");
+          return current;
+        }),
+      ).rejects.toMatchObject({ code: "reentrant_store_call" });
+
+      // The queue survives it: the next write still lands.
+      await registry.store.setState(entry.id, "active");
+      expect(await registry.store.get(entry.id)).toMatchObject({
+        state: "active",
+      });
     });
 
     it("never deletes an entry a revoke has just claimed", async () => {
