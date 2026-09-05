@@ -159,6 +159,7 @@ function toBackend(entry: RegistryEntry): Backend {
     kind: "local",
     provenance: "registry",
     registryState: entry.state,
+    registryHost: entry.host,
   };
 }
 
@@ -252,9 +253,20 @@ async function setRegistryEntryState(
   const entryId = registryEntryId(backend);
   if (!entryId) return;
 
+  // Approve names the address it is approving, so an entry that moved between
+  // the operator reading the row and clicking is refused rather than ratified.
+  const body =
+    action === "approve"
+      ? {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ host: backend.registryHost ?? "" }),
+        }
+      : { method: "POST" };
+
   const response = await registryRequest(
     `${REGISTRY_ENDPOINT}/${encodeURIComponent(entryId)}/${action}`,
-    { method: "POST" },
+    body,
   );
   if (!response.ok) {
     throw new Error(`registry ${action} failed with ${response.status}`);

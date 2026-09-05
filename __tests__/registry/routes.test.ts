@@ -276,7 +276,8 @@ describe("registry routes", () => {
 
     const approved = await json(`${base}/api/registry/${entry.id}/approve`, {
       method: "POST",
-      headers: auth,
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ host: entry.host }),
     });
     expect(approved.status).toBe(200);
     expect(approved.body.entry.state).toBe("active");
@@ -328,11 +329,117 @@ describe("registry routes", () => {
 
     const response = await json(`${base}/api/registry/unknown-id/approve`, {
       method: "POST",
-      headers: { "X-Session-API-Key": SESSION_KEY },
+      headers: {
+        "X-Session-API-Key": SESSION_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ host: "https://a.example" }),
     });
 
     expect(response.status).toBe(404);
     expect(response.body.error).toBe("not_found");
+  });
+
+  /**
+   * An approval is of a machine at an address. Without naming that address the
+   * operator reads the queue, the entry re-registers somewhere else -- still
+   * `pending`, so the row looks unchanged -- and the approval that lands
+   * ratifies a host nobody reviewed.
+   */
+  it("refuses an approval that does not name the host", async () => {
+    const registry = await mountRegistry();
+    const { pubkey, privateKey } = makeHostKey();
+    const body = registrationBody(pubkey);
+    const { entry } = await registry.enrolment.register(
+      body,
+      sign(
+        null,
+        Buffer.from(canonicalPayload(body), "utf8"),
+        privateKey,
+      ).toString("base64"),
+    );
+
+    const response = await json(`${base}/api/registry/${entry.id}/approve`, {
+      method: "POST",
+      headers: {
+        "X-Session-API-Key": SESSION_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("host_required");
+  });
+
+  it("refuses an approval for a host the entry has since left", async () => {
+    const registry = await mountRegistry();
+    const { pubkey, privateKey } = makeHostKey();
+    const body = registrationBody(pubkey);
+    const { entry } = await registry.enrolment.register(
+      body,
+      sign(
+        null,
+        Buffer.from(canonicalPayload(body), "utf8"),
+        privateKey,
+      ).toString("base64"),
+    );
+
+    // The entry moves between the operator reading it and clicking approve.
+    const moved = registrationBody(pubkey, {
+      host: "http://169.254.169.254",
+      nonce: "moved",
+    });
+    await registry.enrolment.register(
+      moved,
+      sign(
+        null,
+        Buffer.from(canonicalPayload(moved), "utf8"),
+        privateKey,
+      ).toString("base64"),
+    );
+
+    const response = await json(`${base}/api/registry/${entry.id}/approve`, {
+      method: "POST",
+      headers: {
+        "X-Session-API-Key": SESSION_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ host: entry.host }),
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toBe("entry_changed");
+    expect(await registry.store.get(entry.id)).toMatchObject({
+      state: "pending",
+    });
+  });
+
+  it("accepts an approval that names the host the entry moved to", async () => {
+    const registry = await mountRegistry();
+    const { pubkey, privateKey } = makeHostKey();
+    const body = registrationBody(pubkey);
+    const { entry } = await registry.enrolment.register(
+      body,
+      sign(
+        null,
+        Buffer.from(canonicalPayload(body), "utf8"),
+        privateKey,
+      ).toString("base64"),
+    );
+
+    const response = await json(`${base}/api/registry/${entry.id}/approve`, {
+      method: "POST",
+      headers: {
+        "X-Session-API-Key": SESSION_KEY,
+        "Content-Type": "application/json",
+      },
+      // A trailing slash is the same address, not a different one.
+      body: JSON.stringify({ host: `${entry.host}/` }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.entry.state).toBe("active");
   });
 
   it("returns 405 for the wrong method and 404 for an unknown route", async () => {

@@ -3,8 +3,11 @@
  *
  *   GET    /api/registry            list entries          (session-key auth)
  *   POST   /api/registry/register   signed enrolment      (signature auth)
- *   POST   /api/registry/:id/approve                      (session-key auth)
+ *   POST   /api/registry/:id/approve  { host }            (session-key auth)
  *   POST   /api/registry/:id/revoke                       (session-key auth)
+ *
+ * Approve names the host it is approving and answers 409 if the entry has
+ * moved since, so the decision is bound to what the operator actually read.
  *
  * Registration is deliberately the one route with no session key: a freshly
  * provisioned node has its own host key but none of the master's credentials.
@@ -13,7 +16,7 @@
 import { createEnrolment } from "./enrolment.mjs";
 import { createInlineProvider } from "./providers/inline.mjs";
 import { secretMatches } from "./session-key.mjs";
-import { createStore, RegistryError } from "./store.mjs";
+import { createStore, normaliseHost, RegistryError } from "./store.mjs";
 
 const REGISTRY_PREFIX = "/api/registry";
 const SIGNATURE_HEADER = "x-registry-signature";
@@ -151,6 +154,36 @@ export function createRegistry({
       }
       requireSessionKey(req);
       const [, id, verb] = action;
+
+      if (verb === "approve") {
+        // An approval has to name the address it is approving. Without it the
+        // operator reads the queue, the entry re-registers somewhere else --
+        // still `pending`, so nothing looks different -- and the approval that
+        // lands ratifies a host nobody looked at. Revocation needs no such
+        // check: withdrawing trust is safe whatever the entry now says.
+        const body = await readJsonBody(req, maxBodyBytes);
+        const expected = body?.host;
+        if (typeof expected !== "string" || expected.trim() === "") {
+          throw new RegistryError(
+            400,
+            "host_required",
+            "approve must name the host it is approving",
+          );
+        }
+        const entry = await store.get(id);
+        if (!entry) {
+          throw new RegistryError(404, "not_found", `no entry with id ${id}`);
+        }
+        if (entry.host !== normaliseHost(expected)) {
+          throw new RegistryError(
+            409,
+            "entry_changed",
+            `${entry.name} now answers on ${entry.host}, not ${expected}; ` +
+              "review it again before approving",
+          );
+        }
+      }
+
       const entry = await store.setState(
         id,
         verb === "approve" ? "active" : "revoked",
