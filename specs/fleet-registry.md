@@ -30,6 +30,10 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
       300-second window, or when its nonce has already been used inside that
       window.
 
+- [x] A registration the registry refuses shall not consume a nonce slot. The
+      table is finite, so spending one on a rejected call lets a flood fill it
+      and answer `503` to the enrolments that would have been accepted.
+
 ### FR-005: A signature is not an authorisation
 
 - [x] A pre-seeded fingerprint shall enrol as `active`. Any other fingerprint
@@ -44,6 +48,14 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
 
 - [x] A revoked entry shall stay revoked when it re-registers, and an approved
       entry shall stay approved once its fingerprint leaves the pre-seed list.
+
+- [x] A hand-approved entry that changes its host shall return to `pending`.
+      An approval is of a machine at an address, and the address was part of
+      what the operator could see; silently repointing the proxy at somewhere
+      they never agreed to is the same escalation by another route. A
+      pre-seeded fingerprint is exempt, because pre-seeding trusts an identity
+      rather than an address, and re-announcing after a reboot or a
+      reassignment is the case self-enrolment exists for.
 
 ### FR-008: Reads and approvals require the session key
 
@@ -176,33 +188,3 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
 
 - [x] Enabling Kubernetes discovery shall create a namespace-scoped Role for
       listing Services, independent of the chart's broad `admin` binding.
-
----
-
-## Deferred
-
-Raised in the pre-merge review, deliberately not fixed here. Both are
-properties of the design rather than defects introduced by phase 1, and both
-are bounded. Recorded so they are not rediscovered from scratch.
-
-### An approved entry may still change its host
-
-`normaliseHost` accepts any `http:`/`https:` URL, and a re-registration may
-change `host` on an entry that is already `active`. An operator approves a
-machine having seen one address; that machine can later point its entry
-somewhere else, a cloud metadata endpoint included.
-
-Keeping `host` updatable is the point of self-enrolment -- re-announcing after
-a reboot, an address change or a restore is the case it exists for -- and
-exploitation needs both an approved attacker-controlled entry and a
-master-key holder to then drive traffic through it. A host allowlist, or
-demoting to `pending` when an approved entry's host changes, would close it.
-
-### A registration flood can exhaust the nonce table
-
-`consumeNonce` records a nonce before the pending-entry cap is checked, so
-self-signed registrations can fill the table (10k entries, 300s window) and
-return `503 nonce_table_full` to legitimate enrolment until it drains. It is
-memory-bounded and self-healing, and the route is unauthenticated by design.
-Checking the cap first would shrink the surface.
-
