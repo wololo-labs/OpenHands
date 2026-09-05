@@ -222,25 +222,28 @@ export function createRegistry({
     if (entryPath && method === "DELETE") {
       requireSessionKey(req);
       const [, id] = entryPath;
-      const existing = await store.get(id);
-      if (!existing) {
-        throw new RegistryError(404, "not_found", `no entry with id ${id}`);
-      }
-      // A revoked entry is the record of a decision, not junk. Forgetting one
-      // un-revokes the machine: the next registration sees no entry, so it
-      // enrols afresh -- straight back to `active` if its fingerprint is
-      // pre-seeded. Tidying up after a flood would quietly re-arm every host
-      // an operator had decommissioned, which is the opposite of "revocation
-      // is final". What a flood leaves behind is `pending`, and that deletes.
-      if (existing.state === "revoked") {
-        throw new RegistryError(
-          409,
-          "entry_revoked",
-          `${existing.name} is revoked, and revoked entries are kept on ` +
-            "purpose; approve it if you want it back",
-        );
-      }
-      await store.remove(id);
+      // Decided inside the store's lock. Reading the entry, finding it not
+      // revoked and then deleting it in a second call discards a revoke that
+      // lands in between: the machine is deleted anyway and re-enrols clean,
+      // straight back to `active` if its fingerprint is pre-seeded.
+      await store.removeIf(id, (existing) => {
+        if (!existing) {
+          throw new RegistryError(404, "not_found", `no entry with id ${id}`);
+        }
+        // A revoked entry is the record of a decision, not junk. Forgetting
+        // one un-revokes the machine, so tidying up after a flood would
+        // quietly re-arm every host an operator had decommissioned, which is
+        // the opposite of "revocation is final". What a flood leaves behind
+        // is `pending`, and that deletes.
+        if (existing.state === "revoked") {
+          throw new RegistryError(
+            409,
+            "entry_revoked",
+            `${existing.name} is revoked, and revoked entries are kept on ` +
+              "purpose; approve it if you want it back",
+          );
+        }
+      });
       sendJson(res, 200, { id });
       return;
     }

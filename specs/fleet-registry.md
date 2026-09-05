@@ -20,7 +20,10 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
       every entry in `misc_settings`, read in full on every registration.
 
 - [x] `DELETE /api/registry/:id` shall forget an entry outright, so junk can
-      be removed rather than only revoked.
+      be removed rather than only revoked. It shall refuse a `revoked` entry,
+      and shall decide that inside the store's lock: reading the entry and
+      deleting it in a second call discards a revoke that lands between the
+      two, and the machine then re-enrols clean.
 
 ### FR-002: Entries persist without a new datastore
 

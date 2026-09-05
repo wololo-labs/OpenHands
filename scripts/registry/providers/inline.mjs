@@ -199,6 +199,28 @@ export function createInlineProvider({
       });
     },
 
+    /**
+     * Remove, with the refusal decided under the lock.
+     *
+     * `check(existing)` is handed the entry as it is at the moment of
+     * removal, not a copy read beforehand, and throws to refuse. Removing is
+     * a decision about an entry like any other: reading it, deciding, and
+     * then deleting in a second call discards anything that lands in
+     * between -- a revoke, most of all, which is the one decision that has
+     * to survive.
+     */
+    removeIf(id, check) {
+      return withLock(async () => {
+        const entries = await readEntries();
+        const existing = entries.find((entry) => entry.id === id) ?? null;
+        await check(existing);
+        const next = entries.filter((entry) => entry.id !== id);
+        if (next.length === entries.length) return false;
+        await writeEntries(next);
+        return true;
+      });
+    },
+
     /** Returns whether an entry was actually removed. */
     remove(id) {
       return withLock(async () => {

@@ -19,6 +19,7 @@
  *   list()             -> entry[]
  *   upsert(entry)      -> entry
  *   remove(id)         -> boolean (whether an entry went)
+ *   removeIf(id, check) -> boolean (check throws to refuse, under the lock)
  *   setState(id, state)-> entry
  *
  * `createStore()` wraps a provider with validation and a `get()` helper, so
@@ -214,10 +215,21 @@ export function createStore(provider) {
       if (wrote) revision += 1;
       return stored;
     },
+    /**
+     * Remove unless `check(existing)` throws. The check runs inside the
+     * provider's lock, so a decision landing between reading the entry and
+     * deleting it -- a revoke -- is seen rather than discarded.
+     */
+    async removeIf(id, check) {
+      const removed = await provider.removeIf(id, check);
+      if (removed) revision += 1;
+      return removed;
+    },
     async remove(id) {
-      const before = (await provider.list()).length;
+      // Only a real deletion is a revision. Counting a no-op DELETE would
+      // throw away every proxy's entry cache for nothing.
       const removed = await provider.remove(id);
-      if ((await provider.list()).length !== before) revision += 1;
+      if (removed) revision += 1;
       return removed;
     },
     async setState(id, state) {

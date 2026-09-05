@@ -574,6 +574,41 @@ describe("registry routes", () => {
       }
     });
 
+    it("never deletes an entry a revoke has just claimed", async () => {
+      // DELETE read the entry, checked that it was not revoked, and then
+      // removed it in a second call. A revoke landing between the two was
+      // discarded and the machine was deleted anyway -- so it re-enrolled
+      // clean, straight back to `active` if its fingerprint is pre-seeded.
+      const registry = await mountRegistry();
+      const { pubkey, privateKey } = makeHostKey();
+      const { entry } = await enrol(registry, pubkey, privateKey);
+      const auth = { "X-Session-API-Key": SESSION_KEY };
+
+      const [revoked, removed] = await Promise.all([
+        json(`${base}/api/registry/${entry.id}/revoke`, {
+          method: "POST",
+          headers: auth,
+        }),
+        json(`${base}/api/registry/${entry.id}`, {
+          method: "DELETE",
+          headers: auth,
+        }),
+      ]);
+
+      const stored = await registry.store.get(entry.id);
+
+      // A revoke that answered 200 is a decision that has landed. Whatever
+      // order the two arrive in, the entry cannot then vanish.
+      if (revoked.status === 200) {
+        expect(stored).not.toBeNull();
+        expect(stored).toMatchObject({ state: "revoked" });
+        expect(removed.status).toBe(409);
+      } else {
+        expect(removed.status).toBe(200);
+        expect(stored).toBeNull();
+      }
+    });
+
     it("holds the entry cap against a burst", async () => {
       // The caps used to be read outside the store's lock and enforced
       // inside it, which is no enforcement at all: forty registrations
