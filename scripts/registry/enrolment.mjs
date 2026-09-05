@@ -28,6 +28,7 @@ import {
 import {
   credRefFor,
   entryId,
+  normaliseEntry,
   normaliseHost,
   RegistryError,
 } from "./store.mjs";
@@ -53,7 +54,24 @@ export const DEFAULT_REPLAY_WINDOW_SECONDS = 300;
  * far past what anyone would work through is already past useful.
  */
 export const DEFAULT_MAX_PENDING_ENTRIES = 100;
-const MAX_TRACKED_NONCES = 10_000;
+/**
+ * Nonces one fingerprint may spend inside a replay window.
+ *
+ * The table has to be bounded, and bounding it *globally* is what made it a
+ * weapon: an entry that already exists skips the pending cap, so a single
+ * enrolled keypair could re-register with fresh nonces until the table was
+ * full and every other machine's enrolment answered "too many in flight".
+ * Bounded per identity, a flood costs the flooder its own budget and nobody
+ * else's. Well above what any real node needs -- one registration per boot,
+ * plus retries.
+ */
+export const DEFAULT_MAX_NONCES_PER_FINGERPRINT = 32;
+/**
+ * Backstop on total tracked nonces. Unreachable by one identity now that the
+ * per-fingerprint bound exists, and unreachable by many because a new
+ * fingerprint has to get past the pending cap before it can spend anything.
+ */
+const MAX_TRACKED_NONCES = 100_000;
 const SSH_ED25519 = "ssh-ed25519";
 const ED25519_RAW_KEY_BYTES = 32;
 const ED25519_SIGNATURE_BYTES = 64;
@@ -164,10 +182,30 @@ export function normaliseFingerprint(value) {
  *     so dropping a decommissioned host from the allowlist is final;
  *   - an already-approved entry keeps its state even once its fingerprint
  *     leaves the pre-seed list;
- *   - a pending entry is promoted only by a pre-seeded fingerprint.
+ *   - a pending entry is promoted only by a pre-seeded fingerprint;
+ *   - a hand-approved entry that changes address returns to `pending`, so
+ *     the operator decides again about the machine as it now is.
+ *
+ * A `stale` entry is only ever produced by a pull source, and a pull source
+ * writes through `sources/sync.mjs` rather than here, so the `stale` branch
+ * of this function is unreachable from enrolment today.
+ *
+ * @param {object|null} existing        the stored entry, or null on a first
+ *                                      registration
+ * @param {boolean}     preSeeded       whether the fingerprint is allowlisted
+ * @param {string}      requestedHost   normalised host being registered
  */
-export function nextState(existing, preSeeded, requestedHost = null) {
+export function nextState(existing, preSeeded, requestedHost) {
   if (!existing) return preSeeded ? "active" : "pending";
+  // Required rather than defaulted: a missing host used to mean "no move",
+  // so a caller that forgot the argument silently lost the check.
+  if (typeof requestedHost !== "string" || requestedHost === "") {
+    throw new RegistryError(
+      500,
+      "invalid_state",
+      "nextState requires the host being registered",
+    );
+  }
   if (existing.state === "revoked") return "revoked";
   if (existing.state === "pending") return preSeeded ? "active" : "pending";
   // An approval is of a machine *at an address*. A pre-seeded fingerprint is
@@ -234,12 +272,20 @@ export function createEnrolment({
   now = () => Date.now(),
   replayWindowSeconds = DEFAULT_REPLAY_WINDOW_SECONDS,
   maxPendingEntries = DEFAULT_MAX_PENDING_ENTRIES,
+  maxNoncesPerFingerprint = DEFAULT_MAX_NONCES_PER_FINGERPRINT,
 }) {
   const preSeeded = new Set(
     allowlist.map(normaliseFingerprint).filter((value) => value !== null),
   );
-  /** nonce -> epoch ms it was accepted, pruned on every call. */
+  /**
+   * `"<fingerprint>:<nonce>"` -> epoch ms it was accepted, pruned on every
+   * call. Keyed by fingerprint as well as nonce so one machine's traffic can
+   * never evict another's, and so two nodes picking the same nonce are not
+   * mistaken for a replay.
+   */
   const seenNonces = new Map();
+  /** fingerprint -> how many of its nonces are currently tracked. */
+  const nonceCounts = new Map();
 
   function assertFresh(ts, nowMs) {
     if (typeof ts !== "number" || !Number.isFinite(ts)) {
@@ -255,18 +301,44 @@ export function createEnrolment({
     }
   }
 
-  function consumeNonce(nonce, nowMs) {
+  function pruneNonces(nowMs) {
     const windowMs = replayWindowSeconds * 1000;
-    for (const [seen, at] of seenNonces) {
-      if (nowMs - at > windowMs) seenNonces.delete(seen);
+    for (const [key, entry] of seenNonces) {
+      if (nowMs - entry.at <= windowMs) continue;
+      seenNonces.delete(key);
+      const remaining = (nonceCounts.get(entry.fingerprint) ?? 1) - 1;
+      if (remaining > 0) {
+        nonceCounts.set(entry.fingerprint, remaining);
+      } else {
+        nonceCounts.delete(entry.fingerprint);
+      }
     }
-    if (seenNonces.has(nonce)) {
+  }
+
+  function consumeNonce(fingerprint, nonce, nowMs) {
+    pruneNonces(nowMs);
+
+    const key = `${fingerprint}:${nonce}`;
+    if (seenNonces.has(key)) {
       throw new RegistryError(
         401,
         "replayed_nonce",
         "nonce has already been used",
       );
     }
+
+    const spent = nonceCounts.get(fingerprint) ?? 0;
+    if (spent >= maxNoncesPerFingerprint) {
+      // This machine's own budget, so the refusal lands on the flooder rather
+      // than on whoever tries to enrol next.
+      throw new RegistryError(
+        429,
+        "too_many_registrations",
+        `this key has registered ${spent} times in the last ` +
+          `${replayWindowSeconds}s; slow down`,
+      );
+    }
+
     if (seenNonces.size >= MAX_TRACKED_NONCES) {
       throw new RegistryError(
         503,
@@ -274,7 +346,8 @@ export function createEnrolment({
         "too many registrations in flight, retry shortly",
       );
     }
-    seenNonces.set(nonce, nowMs);
+    seenNonces.set(key, { at: nowMs, fingerprint });
+    nonceCounts.set(fingerprint, spent + 1);
   }
 
   return {
@@ -333,12 +406,13 @@ export function createEnrolment({
         }
       }
 
-      // After the cap, not before it. A registration this call is about to
-      // refuse must not spend a nonce slot on the way out, or a flood exhausts
-      // the table and 503s the enrolments that would have been accepted.
-      consumeNonce(nonce, nowMs);
-
-      const entry = await store.upsert({
+      // Shaped and validated before the nonce is spent, not after. Every
+      // remaining way this call can be refused -- an over-long name, a version
+      // string past its limit, anything `normaliseEntry` rejects -- used to
+      // throw *after* `consumeNonce`, so a signed but malformed registration
+      // still cost a slot. Ordering the cap ahead of the nonce closed one such
+      // route and left the rest; validating here closes them as a class.
+      const candidate = normaliseEntry({
         id,
         name: body.name,
         host,
@@ -349,6 +423,10 @@ export function createEnrolment({
         state: nextState(existing, isPreSeeded, host),
         lastSeen: new Date(nowMs).toISOString(),
       });
+
+      consumeNonce(fingerprint, nonce, nowMs);
+
+      const entry = await store.upsert(candidate);
 
       return { entry, created: existing === null };
     },

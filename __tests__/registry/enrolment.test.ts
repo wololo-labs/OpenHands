@@ -191,17 +191,42 @@ describe("verifySignature", () => {
 });
 
 describe("nextState", () => {
+  const HOST = "https://node.example";
+
   it("keeps a revoked entry revoked even when it re-enrols pre-seeded", () => {
-    expect(nextState({ state: "revoked" }, true)).toBe("revoked");
+    expect(nextState({ state: "revoked", host: HOST }, true, HOST)).toBe(
+      "revoked",
+    );
   });
 
   it("keeps an approved entry active once its fingerprint is un-seeded", () => {
-    expect(nextState({ state: "active" }, false)).toBe("active");
+    expect(nextState({ state: "active", host: HOST }, false, HOST)).toBe(
+      "active",
+    );
   });
 
   it("promotes a pending entry only for a pre-seeded fingerprint", () => {
-    expect(nextState({ state: "pending" }, true)).toBe("active");
-    expect(nextState({ state: "pending" }, false)).toBe("pending");
+    expect(nextState({ state: "pending", host: HOST }, true, HOST)).toBe(
+      "active",
+    );
+    expect(nextState({ state: "pending", host: HOST }, false, HOST)).toBe(
+      "pending",
+    );
+  });
+
+  it("refuses to decide without the host being registered", () => {
+    // The host used to default to null, which read as "not a move" -- so a
+    // caller that forgot the argument silently lost the check. Every caller
+    // is untyped `.mjs`, so the guard has to hold at runtime; the cast is
+    // what a caller that forgot looks like from here.
+    const callWithoutHost = nextState as unknown as (
+      existing: unknown,
+      preSeeded: boolean,
+    ) => string;
+
+    expect(() =>
+      callWithoutHost({ state: "active", host: HOST }, false),
+    ).toThrowError(/requires the host/);
   });
 });
 
@@ -677,6 +702,63 @@ describe("an approved entry may not silently move", () => {
   });
 });
 
+describe("one machine's flood cannot stop another machine enrolling", () => {
+  /**
+   * The property, stated as the outcome rather than as an ordering. The
+   * previous version of this suite asserted that the pending cap was checked
+   * before the nonce was consumed, which was true while the flood still
+   * worked: an entry that already exists skips the cap entirely, so one
+   * enrolled keypair could spend nonces until the shared table was full and
+   * every other machine got "too many in flight".
+   */
+  it("still enrols a fresh machine after an enrolled one floods", async () => {
+    const { enrolment } = makeEnrolment([], { maxNoncesPerFingerprint: 4 });
+    const attacker = makeHostKey();
+
+    // Enrols once legitimately, so it is an existing entry from here on and
+    // the pending cap never looks at it again.
+    const first = makeBody(attacker.pubkey, { name: "attacker", nonce: "a0" });
+    await enrolment.register(first, signBody(first, attacker.privateKey));
+
+    let refusals = 0;
+    for (let index = 1; index < 200; index += 1) {
+      const flood = makeBody(attacker.pubkey, {
+        name: "attacker",
+        nonce: `a${index}`,
+      });
+      try {
+        await enrolment.register(flood, signBody(flood, attacker.privateKey));
+      } catch (error) {
+        refusals += 1;
+        // The refusal lands on the flooder, and says so.
+        expect((error as { code: string }).code).toBe("too_many_registrations");
+      }
+    }
+    expect(refusals).toBeGreaterThan(0);
+
+    const victim = makeHostKey();
+    const clean = makeBody(victim.pubkey, { name: "victim", nonce: "v0" });
+
+    await expect(
+      enrolment.register(clean, signBody(clean, victim.privateKey)),
+    ).resolves.toMatchObject({ created: true });
+  });
+
+  it("does not mistake two machines picking the same nonce for a replay", async () => {
+    const { enrolment } = makeEnrolment();
+    const one = makeHostKey();
+    const two = makeHostKey();
+
+    const a = makeBody(one.pubkey, { name: "one", nonce: "same" });
+    await enrolment.register(a, signBody(a, one.privateKey));
+
+    const b = makeBody(two.pubkey, { name: "two", nonce: "same" });
+    await expect(
+      enrolment.register(b, signBody(b, two.privateKey)),
+    ).resolves.toMatchObject({ created: true });
+  });
+});
+
 describe("a refused registration does not spend a nonce slot", () => {
   /**
    * The nonce table is the replay defence and it is finite. Consuming a slot
@@ -698,6 +780,29 @@ describe("a refused registration does not spend a nonce slot", () => {
     await expect(enrolment.register(body, signature)).rejects.toMatchObject({
       code: "too_many_pending",
     });
+  });
+
+  it("does not spend a slot on a registration the store would reject", async () => {
+    // Everything `normaliseEntry` refuses used to throw *after* the nonce was
+    // consumed, so a signed but malformed registration still cost a slot.
+    const { enrolment } = makeEnrolment([], { maxNoncesPerFingerprint: 2 });
+    const node = makeHostKey();
+
+    for (let index = 0; index < 10; index += 1) {
+      const malformed = makeBody(node.pubkey, {
+        name: "x".repeat(200),
+        nonce: `bad-${index}`,
+      });
+      await expect(
+        enrolment.register(malformed, signBody(malformed, node.privateKey)),
+      ).rejects.toMatchObject({ status: 400 });
+    }
+
+    // The budget is untouched, so a well-formed registration still lands.
+    const good = makeBody(node.pubkey, { nonce: "good" });
+    await expect(
+      enrolment.register(good, signBody(good, node.privateKey)),
+    ).resolves.toMatchObject({ created: true });
   });
 
   it("still refuses a genuine replay of an accepted registration", async () => {
