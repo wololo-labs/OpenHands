@@ -196,16 +196,22 @@ export function createStore(provider) {
      *
      * `apply(existing, entries)` receives the entry, and the whole entry list,
      * as they are at the moment of writing, and returns the entry to store.
-     * Anything it throws aborts the write. Use this rather than reading with
+     * Returning `undefined` writes nothing, for a caller whose decision is
+     * "leave it alone" once it sees the entry as it really is. Anything it
+     * throws aborts the write. Use this rather than reading with
      * `get()`/`list()` and then calling `upsert`/`setState`: between those two
      * the registry can change, and every precondition checked that way is a
      * race -- whether it is about one entry or about how many there are.
      */
     async mutate(id, apply) {
-      const stored = await provider.mutate(id, async (existing, entries) =>
-        normaliseEntry(await apply(existing, entries)),
-      );
-      revision += 1;
+      let wrote = false;
+      const stored = await provider.mutate(id, async (existing, entries) => {
+        const next = await apply(existing, entries);
+        if (next === undefined) return undefined;
+        wrote = true;
+        return normaliseEntry(next);
+      });
+      if (wrote) revision += 1;
       return stored;
     },
     async remove(id) {
