@@ -563,3 +563,154 @@ describe("the pending queue is bounded", () => {
     expect(entry.state).toBe("active");
   });
 });
+
+describe("an approved entry may not silently move", () => {
+  /**
+   * An approval is of a machine *at an address*: that is what the operator
+   * could see when they granted it. Letting an approved entry repoint itself
+   * turns the master into a proxy toward somewhere nobody agreed to -- a link
+   *-local metadata address, say -- driven by whoever next selects it in the
+   * switcher.
+   *
+   * @spec FR-007
+   */
+  it("sends a hand-approved entry back to the queue when its host changes", async () => {
+    const { store, enrolment } = makeEnrolment();
+    const node = makeHostKey();
+
+    const first = makeBody(node.pubkey, { nonce: "1" });
+    const { entry: enrolled } = await enrolment.register(
+      first,
+      signBody(first, node.privateKey),
+    );
+    expect(enrolled.state).toBe("pending");
+
+    await store.setState(enrolled.id, "active");
+
+    const moved = makeBody(node.pubkey, {
+      host: "http://169.254.169.254",
+      nonce: "2",
+    });
+    const { entry: after } = await enrolment.register(
+      moved,
+      signBody(moved, node.privateKey),
+    );
+
+    expect(after.host).toBe("http://169.254.169.254");
+    expect(after.state, "a moved entry needs approving again").toBe("pending");
+  });
+
+  it("leaves an approved entry active when it re-announces the same host", async () => {
+    const { store, enrolment } = makeEnrolment();
+    const node = makeHostKey();
+
+    const first = makeBody(node.pubkey, { nonce: "1" });
+    const { entry } = await enrolment.register(
+      first,
+      signBody(first, node.privateKey),
+    );
+    await store.setState(entry.id, "active");
+
+    // A trailing slash is not an address change.
+    const again = makeBody(node.pubkey, {
+      host: `${first.host}/`,
+      nonce: "2",
+    });
+    const { entry: after } = await enrolment.register(
+      again,
+      signBody(again, node.privateKey),
+    );
+
+    expect(after.state).toBe("active");
+  });
+
+  it("lets a pre-seeded machine move without re-approval", async () => {
+    // Pre-seeding trusts an identity, not an address, and re-announcing after
+    // a reboot or a reassignment is the case self-enrolment is built for.
+    const node = makeHostKey();
+    const { store, enrolment } = makeEnrolment([
+      fingerprintFromPublicKey(node.pubkey),
+    ]);
+
+    const first = makeBody(node.pubkey, { nonce: "1" });
+    const { entry } = await enrolment.register(
+      first,
+      signBody(first, node.privateKey),
+    );
+    expect(entry.state).toBe("active");
+
+    const moved = makeBody(node.pubkey, {
+      host: "https://moved.example",
+      nonce: "2",
+    });
+    const { entry: after } = await enrolment.register(
+      moved,
+      signBody(moved, node.privateKey),
+    );
+
+    expect(after.host).toBe("https://moved.example");
+    expect(after.state).toBe("active");
+    expect(await store.list()).toHaveLength(1);
+  });
+
+  it("keeps a revoked entry revoked even when it moves", async () => {
+    const { store, enrolment } = makeEnrolment();
+    const node = makeHostKey();
+
+    const first = makeBody(node.pubkey, { nonce: "1" });
+    const { entry } = await enrolment.register(
+      first,
+      signBody(first, node.privateKey),
+    );
+    await store.setState(entry.id, "revoked");
+
+    const moved = makeBody(node.pubkey, {
+      host: "https://moved.example",
+      nonce: "2",
+    });
+    const { entry: after } = await enrolment.register(
+      moved,
+      signBody(moved, node.privateKey),
+    );
+
+    expect(after.state).toBe("revoked");
+  });
+});
+
+describe("a refused registration does not spend a nonce slot", () => {
+  /**
+   * The nonce table is the replay defence and it is finite. Consuming a slot
+   * for a registration the same call is about to refuse lets a flood fill it
+   * and 503 the enrolments that would have been accepted.
+   */
+  it("leaves the table intact when the pending cap refuses a registration", async () => {
+    const { enrolment } = makeEnrolment([], { maxPendingEntries: 0 });
+    const node = makeHostKey();
+    const body = makeBody(node.pubkey, { nonce: "reused" });
+    const signature = signBody(body, node.privateKey);
+
+    await expect(enrolment.register(body, signature)).rejects.toMatchObject({
+      status: 429,
+    });
+
+    // The nonce is still spendable: the rejection above cost nothing. It is
+    // the cap that refuses this too, never `replayed_nonce`.
+    await expect(enrolment.register(body, signature)).rejects.toMatchObject({
+      code: "too_many_pending",
+    });
+  });
+
+  it("still refuses a genuine replay of an accepted registration", async () => {
+    const { enrolment } = makeEnrolment();
+    const node = makeHostKey();
+    const body = makeBody(node.pubkey, { nonce: "once" });
+    const signature = signBody(body, node.privateKey);
+
+    await enrolment.register(body, signature);
+
+    await expect(enrolment.register(body, signature)).rejects.toMatchObject({
+      status: 401,
+      code: "replayed_nonce",
+    });
+  });
+});

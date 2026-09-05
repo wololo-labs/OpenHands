@@ -25,7 +25,12 @@ import {
   verify as verifyEd25519,
 } from "node:crypto";
 
-import { credRefFor, entryId, RegistryError } from "./store.mjs";
+import {
+  credRefFor,
+  entryId,
+  normaliseHost,
+  RegistryError,
+} from "./store.mjs";
 
 /** Fields covered by the signature, in canonical (alphabetical) order. */
 export const SIGNED_FIELDS = Object.freeze([
@@ -161,10 +166,20 @@ export function normaliseFingerprint(value) {
  *     leaves the pre-seed list;
  *   - a pending entry is promoted only by a pre-seeded fingerprint.
  */
-export function nextState(existing, preSeeded) {
+export function nextState(existing, preSeeded, requestedHost = null) {
   if (!existing) return preSeeded ? "active" : "pending";
   if (existing.state === "revoked") return "revoked";
   if (existing.state === "pending") return preSeeded ? "active" : "pending";
+  // An approval is of a machine *at an address*. A pre-seeded fingerprint is
+  // trusted as an identity, so it may move freely -- that is what pre-seeding
+  // means, and re-announcing after a reboot or an address change is the case
+  // self-enrolment exists for. An entry approved by hand was approved on what
+  // the operator could see, and the host was part of it, so moving one sends
+  // it back to the queue they already have rather than silently repointing
+  // the proxy at somewhere they never agreed to.
+  if (!preSeeded && requestedHost && requestedHost !== existing.host) {
+    return "pending";
+  }
   return existing.state;
 }
 
@@ -290,17 +305,21 @@ export function createEnrolment({
           "signature does not verify against pubkey",
         );
       }
-      consumeNonce(nonce, nowMs);
 
       const fingerprint = fingerprintFromPublicKey(body.pubkey);
+      const isPreSeeded = preSeeded.has(fingerprint);
       const id = entryId(fingerprint);
+      // Normalised here rather than left to the store, because the state
+      // machine below compares it against what is already stored and a
+      // trailing slash is not an address change.
+      const host = normaliseHost(body.host);
       const entries = await store.list();
       const existing = entries.find((entry) => entry.id === id) ?? null;
 
       // Only a *new* entry that would land pending is capped. A machine that is
       // already listed, and one whose fingerprint is pre-seeded, always gets
       // through, so a flood cannot lock out the fleet it is trying to drown.
-      if (!existing && !preSeeded.has(fingerprint)) {
+      if (!existing && !isPreSeeded) {
         const pending = entries.filter(
           (entry) => entry.state === "pending",
         ).length;
@@ -314,15 +333,20 @@ export function createEnrolment({
         }
       }
 
+      // After the cap, not before it. A registration this call is about to
+      // refuse must not spend a nonce slot on the way out, or a flood exhausts
+      // the table and 503s the enrolments that would have been accepted.
+      consumeNonce(nonce, nowMs);
+
       const entry = await store.upsert({
         id,
         name: body.name,
-        host: body.host,
+        host,
         pubkey: body.pubkey,
         fingerprint,
         credRef: resolveCredRef(existing, fingerprint, body.credRef),
         version: body.version,
-        state: nextState(existing, preSeeded.has(fingerprint)),
+        state: nextState(existing, isPreSeeded, host),
         lastSeen: new Date(nowMs).toISOString(),
       });
 
