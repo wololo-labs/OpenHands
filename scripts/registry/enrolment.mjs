@@ -545,7 +545,16 @@ export function createEnrolment({
         // never really used. Keeping it would let an agent-server outage burn
         // a node's budget and lock it out of re-enrolling for the rest of the
         // window, exactly when re-enrolling matters.
-        if (spent) releaseNonce(fingerprint, nonce);
+        //
+        // Narrowed to the one code that means "the write did not happen". A
+        // release is a hole whenever the write *did* happen, and this branch
+        // is the natural place for a future edit to widen without noticing
+        // that. Anything else that throws here has not reserved: the nonce
+        // check and the caps run before the reservation, and a failed read
+        // means the callback never ran at all.
+        if (spent && error?.code === "store_unavailable") {
+          releaseNonce(fingerprint, nonce);
+        }
         throw error;
       }
 
