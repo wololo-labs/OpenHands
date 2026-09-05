@@ -19,7 +19,8 @@ import {
   signRegistration,
   toSshPublicKeyLine,
 } from "../../scripts/registry/sign.mjs";
-import { credRefForKeyPair, parseArgs, runEnrol } from "../../bin/enrol.mjs";
+import { parseArgs, runEnrol } from "../../bin/enrol.mjs";
+import { credRefFor } from "../../scripts/registry/store.mjs";
 import { createFileSecretProvider } from "../../scripts/registry/secrets/file.mjs";
 import {
   assertValidSecretRef,
@@ -419,7 +420,7 @@ describe("enrol CLI", () => {
     // The CLI resolves "file" through the registry of providers; point that
     // provider's root at the temp dir by pre-creating the same reference there.
     const keyPair = await loadKeyPair(hostKeyPath);
-    const derived = credRefForKeyPair(keyPair);
+    const derived = credRefFor(keyPair.fingerprint);
     const provider = createFileSecretProvider({ root });
     await provider.put(derived, "unused");
 
@@ -431,8 +432,7 @@ describe("enrol CLI", () => {
         "hetzner",
         "--host",
         "https://hetzner.example.ts.net:8443",
-        "--cred-ref",
-        "openhands/somewhere-else/session-key",
+        "--has-credential",
         "--key",
         hostKeyPath,
       ],

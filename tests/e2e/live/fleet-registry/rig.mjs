@@ -472,7 +472,7 @@ async function enrolNode1(state) {
       `--registry ${shellQuote(masterUrl)}`,
       `--name ${shellQuote(NODE1.name)}`,
       `--host ${shellQuote(state.node1Url)}`,
-      `--cred-ref ${shellQuote(credRef)}`,
+      "--has-credential",
       `--key ${NODE1.keyPath}`,
       `--version ${shellQuote(version)}`,
     ].join(" "),

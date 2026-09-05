@@ -102,10 +102,12 @@ signed the registration. Re-announcing after a reboot or an address change is
 the case this design exists for.
 
 `agent-canvas enrol` derives the same reference, so it publishes the session
-key where the registry will look for it and prints the location. A machine that
-enrolled before its secret existed is repaired by re-running enrol with a
-secret provider; the reference is deterministic, so nothing has to be
-hand-edited.
+key where the registry will look for it and prints the location. There is no
+reference to pass: `--has-credential` declares that a key was published out of
+band, and the derived location is printed for you. A machine that enrolled
+before its secret existed is repaired by re-running enrol with a secret
+provider, and a re-announcement that omits the flag keeps whatever reference is
+already stored rather than clearing it.
 
 The pending queue is capped (100 by default). Registration is unauthenticated
 and every fresh keypair is a new fingerprint, so the cap is what stops anyone

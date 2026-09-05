@@ -55,11 +55,11 @@ OPTIONS:
                             (${SECRET_PROVIDER_NAMES.join(", ")})
   --secret <value>          Session key to publish; defaults to
                             OH_SESSION_API_KEYS_0 or SESSION_API_KEY
-  --cred-ref <ref>          Declare that this machine's session key has been
+  --has-credential          Declare that this machine's session key has been
                             published out of band. The registry derives the
                             reference it stores from this host's fingerprint,
-                            so the value passed here is advisory and the
-                            derived one is printed for you
+                            so there is no reference to pass; the derived one
+                            is printed for you
   --version <version>       Agent server version to record
   --key <path>              Private key to sign with
                             (default: ${DEFAULT_HOST_KEY_PATH})
@@ -97,7 +97,7 @@ export function parseArgs(argv) {
     host: null,
     secretProvider: null,
     secret: null,
-    credRef: null,
+    hasCredential: false,
     version: null,
     keyPath: DEFAULT_HOST_KEY_PATH,
     keyPathExplicit: false,
@@ -124,8 +124,8 @@ export function parseArgs(argv) {
       case "--secret":
         options.secret = argv[++i] ?? null;
         break;
-      case "--cred-ref":
-        options.credRef = argv[++i] ?? null;
+      case "--has-credential":
+        options.hasCredential = true;
         break;
       case "--version":
         options.version = argv[++i] ?? null;
@@ -150,18 +150,6 @@ export function parseArgs(argv) {
   }
 
   return options;
-}
-
-/**
- * Where this machine's session key must be published.
- *
- * Derived from the host key's fingerprint rather than chosen, because the
- * registry derives the same value and ignores whatever a registration asks
- * for: a node that could name its own reference could name one belonging to
- * another machine. Re-exported under the old name so callers keep working.
- */
-export function credRefForKeyPair(keyPair) {
-  return credRefFor(keyPair.fingerprint);
 }
 
 function resolveSecret(options, env) {
@@ -220,7 +208,7 @@ export async function runEnrol(
   // The registry derives the stored reference from this machine's fingerprint,
   // so the only thing a registration decides is *whether* there is a credential
   // to resolve at all.
-  const derivedCredRef = credRefForKeyPair(keyPair);
+  const derivedCredRef = credRefFor(keyPair.fingerprint);
   let credRef = null;
   if (options.secretProvider) {
     const provider = createSecretProvider(options.secretProvider);
@@ -241,14 +229,12 @@ export async function runEnrol(
     credRef = derivedCredRef;
     await provider.put(credRef, secret);
     log(`Published this machine's session key at: ${credRef}`);
-  } else if (options.credRef) {
-    // A reference without a provider is legitimate: the operator published the
-    // secret out of band. The value they passed is advisory -- the registry
-    // stores the derived one -- so say where the secret actually has to live.
+  } else if (options.hasCredential) {
+    // Declaring a credential without publishing one here is legitimate: the
+    // operator put it in place out of band. Say where it has to live, since
+    // the registry derives that location rather than accepting one.
     credRef = derivedCredRef;
-    if (options.credRef !== derivedCredRef) {
-      log(`Publish this machine's session key at: ${derivedCredRef}`);
-    }
+    log(`Publish this machine's session key at: ${derivedCredRef}`);
   }
 
   const body = buildRegistrationBody({
