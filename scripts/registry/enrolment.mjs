@@ -184,8 +184,14 @@ export function nextState(existing, preSeeded) {
  * derived: repointing an entry now yields the credential of the machine that
  * enrolled it, which is the one whose host key signed the registration.
  */
-export function resolveCredRef(fingerprint, requested) {
-  return requested ? credRefFor(fingerprint) : null;
+export function resolveCredRef(existing, fingerprint, requested) {
+  // Sticky, because a re-registration that simply omits the flag is the
+  // ordinary case: a node re-announcing after a reboot or an address change
+  // has no reason to restate that its key was published. Clearing the
+  // reference there leaves an entry that is still `active` and still in the
+  // switcher while every request through it 403s. There is no reason to ever
+  // unset it now that it cannot be forged.
+  return requested || existing?.credRef ? credRefFor(fingerprint) : null;
 }
 
 function requireBodyString(body, field) {
@@ -314,7 +320,7 @@ export function createEnrolment({
         host: body.host,
         pubkey: body.pubkey,
         fingerprint,
-        credRef: resolveCredRef(fingerprint, body.credRef),
+        credRef: resolveCredRef(existing, fingerprint, body.credRef),
         version: body.version,
         state: nextState(existing, preSeeded.has(fingerprint)),
         lastSeen: new Date(nowMs).toISOString(),

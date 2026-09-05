@@ -458,6 +458,34 @@ describe("an entry may not name a credential reference it does not own", () => {
     expect(after.credRef).not.toBe(victimEntry.credRef);
   });
 
+  it("keeps a stored reference when a re-registration omits it", async () => {
+    // Re-announcing after a reboot or an address change is the ordinary case
+    // and carries no credential flag. Clearing the reference there leaves an
+    // entry that is still active and still listed while every request 403s.
+    const { enrolment } = makeEnrolment();
+    const node = makeHostKey();
+
+    const first = makeBody(node.pubkey, { nonce: "1" });
+    const { entry: before } = await enrolment.register(
+      first,
+      signBody(first, node.privateKey),
+    );
+    expect(before.credRef).toBe(credRefFor(before.fingerprint));
+
+    const reannounce = makeBody(node.pubkey, {
+      credRef: null,
+      host: "https://moved.example",
+      nonce: "2",
+    });
+    const { entry: after } = await enrolment.register(
+      reannounce,
+      signBody(reannounce, node.privateKey),
+    );
+
+    expect(after.host).toBe("https://moved.example");
+    expect(after.credRef).toBe(before.credRef);
+  });
+
   it("keeps an entry with no credential reference at none", async () => {
     const { enrolment } = makeEnrolment();
     const node = makeHostKey();
