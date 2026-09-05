@@ -674,26 +674,40 @@ describe("registry routes", () => {
     });
 
     it("never lets a registration undo a revoke", async () => {
+      // Repeated, because one pass proves nothing: the two calls can land in
+      // either order and only one order exercised the bug. A registration
+      // that decides its state before the lock and writes after it loses this
+      // within a couple of rounds; deciding inside the lock wins every round,
+      // whichever way they land.
       const registry = await mountRegistry();
-      const { pubkey, privateKey } = makeHostKey();
-      const { entry } = await enrol(registry, pubkey, privateKey);
 
-      await Promise.allSettled([
-        enrol(registry, pubkey, privateKey, { nonce: "inflight" }),
-        json(`${base}/api/registry/${entry.id}/revoke`, {
-          method: "POST",
-          headers: { "X-Session-API-Key": SESSION_KEY },
-        }),
-      ]);
+      for (let round = 0; round < 10; round += 1) {
+        const { pubkey, privateKey } = makeHostKey();
+        const { entry } = await enrol(registry, pubkey, privateKey, {
+          name: `r${round}`,
+          nonce: `r${round}`,
+        });
 
-      // A machine being revoked is precisely one that may still be
-      // re-registering, so the revoke has to win once it has landed.
-      const stored = await registry.store.get(entry.id);
-      expect(stored?.state).toBe("revoked");
+        await Promise.allSettled([
+          enrol(registry, pubkey, privateKey, { nonce: `inflight${round}` }),
+          json(`${base}/api/registry/${entry.id}/revoke`, {
+            method: "POST",
+            headers: { "X-Session-API-Key": SESSION_KEY },
+          }),
+        ]);
 
-      // And it stays revoked for everything that follows.
-      await enrol(registry, pubkey, privateKey, { nonce: "after" });
-      expect((await registry.store.get(entry.id))?.state).toBe("revoked");
+        // A machine being revoked is precisely one that may still be
+        // re-registering, so the revoke has to win once it has landed.
+        expect(await registry.store.get(entry.id)).toMatchObject({
+          state: "revoked",
+        });
+
+        // And it stays revoked for everything that follows.
+        await enrol(registry, pubkey, privateKey, { nonce: `after${round}` });
+        expect(await registry.store.get(entry.id)).toMatchObject({
+          state: "revoked",
+        });
+      }
     });
   });
 
