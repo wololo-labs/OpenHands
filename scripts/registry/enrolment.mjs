@@ -78,13 +78,17 @@ export const DEFAULT_MAX_ENTRIES = 500;
  */
 export const DEFAULT_MAX_NONCES_PER_FINGERPRINT = 32;
 /**
- * Backstop on total tracked nonces. Unreachable by one identity now that the
- * per-fingerprint bound exists, and unreachable by many because a new
- * fingerprint has to get past the pending cap before it can spend anything.
+ * Backstop on total tracked nonces.
+ *
+ * One identity cannot reach it, because of the per-fingerprint bound. Many
+ * cannot either, because a slot is only *held* by a registration that was
+ * written: everything else hands it straight back, so a flood spending a
+ * fresh fingerprint per attempt leaves nothing behind. What can be held at
+ * once is therefore bounded by the entry cap times the per-fingerprint bound,
+ * plus whatever is genuinely in flight -- and requests in flight are bounded
+ * by the connections serving them, not by this table.
  */
 const MAX_TRACKED_NONCES = 100_000;
-/** Refusals that keep the nonce they were charged. See `register`. */
-const CHARGED_REFUSALS = new Set(["too_many_entries", "too_many_pending"]);
 const SSH_ED25519 = "ssh-ed25519";
 const ED25519_RAW_KEY_BYTES = 32;
 const ED25519_SIGNATURE_BYTES = 64;
@@ -510,17 +514,16 @@ export function createEnrolment({
           };
         });
       } catch (error) {
-        // A write that never happened did not really use its nonce; holding it
-        // would let an agent-server outage burn a node's whole budget and lock
-        // it out of re-enrolling for the rest of the window, exactly when
+        // Every failure hands the slot back, cap refusals included. The slot
+        // is in a table shared by the whole fleet, and a flood spends a fresh
+        // fingerprint per attempt, so charging it costs the attacker nothing
+        // and fills the table for everyone else: refuse a hundred thousand
+        // registrations by the entry cap and the next real node is told
+        // `nonce_table_full`. Holding a slot for a write that never happened
+        // also lets an agent-server outage burn a node's budget and lock it
+        // out of re-enrolling for the rest of the window, exactly when
         // re-enrolling matters.
-        //
-        // A cap refusal is the exception, and deliberately so: knocking on a
-        // full registry costs a settings read, so it has to cost the caller
-        // something too.
-        if (!CHARGED_REFUSALS.has(error?.code)) {
-          releaseNonce(fingerprint, nonce);
-        }
+        releaseNonce(fingerprint, nonce);
         throw error;
       }
 

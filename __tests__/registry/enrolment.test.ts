@@ -780,46 +780,14 @@ describe("a refused registration does not spend a nonce slot", () => {
    * for a registration the same call is about to refuse lets a flood fill it
    * and 503 the enrolments that would have been accepted.
    */
-  it("charges the caller for knocking on a full queue", async () => {
-    // Deliberately *not* free. A registration refused by the pending cap has
-    // already cost a settings read, so letting a fresh keypair knock without
-    // limit is the amplification the cap is supposed to remove.
+  it("hands the slot back when a cap refuses the registration", async () => {
+    // Charging for a cap refusal reads as making a flood pay, and does the
+    // opposite: the flooder spends a throwaway keypair per attempt while the
+    // slots come out of a table the whole fleet shares. Refuse enough
+    // registrations that way and the next real node is told the table is
+    // full.
     const { enrolment } = makeEnrolment([], {
       maxPendingEntries: 0,
-      maxNoncesPerFingerprint: 2,
-    });
-    const node = makeHostKey();
-
-    for (const nonce of ["a", "b"]) {
-      const body = makeBody(node.pubkey, { nonce });
-      await expect(
-        enrolment.register(body, signBody(body, node.privateKey)),
-      ).rejects.toMatchObject({ code: "too_many_pending" });
-    }
-
-    // Budget spent: the next attempt is turned away before the store is read.
-    const third = makeBody(node.pubkey, { nonce: "c" });
-    await expect(
-      enrolment.register(third, signBody(third, node.privateKey)),
-    ).rejects.toMatchObject({ code: "too_many_registrations" });
-  });
-
-  it("hands the slot back when the write itself fails", async () => {
-    // An agent-server outage must not burn a node's budget and lock it out of
-    // re-enrolling for the rest of the window -- that is exactly when
-    // re-enrolling matters.
-    const store = createStore(createMemoryProvider());
-    let failing = true;
-    const original = store.mutate.bind(store);
-    store.mutate = async (id: string, apply: never) => {
-      if (failing) {
-        throw new RegistryError(502, "store_unavailable", "settings write failed");
-      }
-      return original(id, apply);
-    };
-    const enrolment = createEnrolment({
-      store,
-      now: () => NOW_MS,
       maxNoncesPerFingerprint: 2,
     });
     const node = makeHostKey();
@@ -828,14 +796,32 @@ describe("a refused registration does not spend a nonce slot", () => {
       const body = makeBody(node.pubkey, { nonce });
       await expect(
         enrolment.register(body, signBody(body, node.privateKey)),
-      ).rejects.toMatchObject({ code: "store_unavailable" });
+      ).rejects.toMatchObject({ code: "too_many_pending" });
+    }
+  });
+
+  it("keeps the table clear of registrations a cap refused", async () => {
+    // The flood shape: a throwaway fingerprint per attempt, every one refused
+    // by the entry cap. A refusal that keeps its slot is indistinguishable
+    // from a registration that used one, and the table is shared, so a
+    // hundred thousand of these lock the fleet out with `nonce_table_full`.
+    // The slot is only observable through the replay check: if the nonce is
+    // still spendable, nothing was held.
+    const { enrolment, store } = makeEnrolment([], { maxEntries: 1 });
+    const first = makeHostKey();
+    const opening = makeBody(first.pubkey, { nonce: "in" });
+    await enrolment.register(opening, signBody(opening, first.privateKey));
+
+    const flooder = makeHostKey();
+    const knock = makeBody(flooder.pubkey, { nonce: "knock" });
+    const signature = signBody(knock, flooder.privateKey);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(
+        enrolment.register(knock, signature),
+      ).rejects.toMatchObject({ code: "too_many_entries" });
     }
 
-    failing = false;
-    const recovered = makeBody(node.pubkey, { nonce: "e" });
-    await expect(
-      enrolment.register(recovered, signBody(recovered, node.privateKey)),
-    ).resolves.toMatchObject({ created: true });
+    expect(await store.list()).toHaveLength(1);
   });
 
   it("does not spend a slot on a registration the store would reject", async () => {

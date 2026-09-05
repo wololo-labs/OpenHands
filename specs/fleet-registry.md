@@ -45,9 +45,11 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
       pending cap, so one enrolled keypair could spend nonces until the shared
       table was full and every other machine's enrolment was refused.
 
-- [x] A registration refused for its body shall not consume a nonce slot, and
-      one whose write then fails shall hand its slot back. Being refused by a
-      cap shall consume one: knocking on a full queue is not free.
+- [x] No refused registration shall hold a nonce slot, for any reason: a
+      malformed body, a failed write, or a cap. Only a registration that was
+      written keeps one. Charging a refusal reads as making a flood pay and
+      does the reverse, because the flooder spends a throwaway keypair per
+      attempt while the slots come out of a table the whole fleet shares.
 
 ### FR-005: A signature is not an authorisation
 
