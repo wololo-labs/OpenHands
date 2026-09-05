@@ -90,7 +90,13 @@ export async function syncSourceEntries({
   }
 
   for (const entry of existing) {
+    // Filtered against the snapshot first, so an idle poll over a settled
+    // fleet does no writes at all: every entry here is already `stale` or
+    // `revoked` and there is nothing to say. The check is repeated under the
+    // lock below because this copy can be out of date; it is only ever
+    // skipping work, never deciding.
     if (entry.source !== source || seen.has(entry.id)) continue;
+    if (entry.state === "stale" || entry.state === "revoked") continue;
     // Re-checked under the lock for the same reason: the entry may have been
     // revoked since the listing above was read.
     await store.mutate(entry.id, (current) => {
