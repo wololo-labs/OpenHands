@@ -45,10 +45,12 @@ function sendError(res, error) {
   const code = error instanceof RegistryError ? error.code : "internal_error";
   const message =
     error instanceof RegistryError ? error.message : "internal registry error";
+  const details =
+    error instanceof RegistryError ? (error.details ?? null) : null;
   if (status >= 500) {
     console.error(`[registry] ${code}:`, error);
   }
-  sendJson(res, status, { error: code, message });
+  sendJson(res, status, { error: code, message, ...(details ? { details } : {}) });
 }
 
 async function readJsonBody(req, maxBodyBytes) {
@@ -155,39 +157,47 @@ export function createRegistry({
       requireSessionKey(req);
       const [, id, verb] = action;
 
+      // An approval has to name the address it is approving. Without it the
+      // operator reads the queue, the entry re-registers somewhere else --
+      // still `pending`, so nothing looks different -- and the approval that
+      // lands ratifies a host nobody looked at. Revocation needs no such
+      // check: withdrawing trust is safe whatever the entry now says.
+      let expectedHost = null;
       if (verb === "approve") {
-        // An approval has to name the address it is approving. Without it the
-        // operator reads the queue, the entry re-registers somewhere else --
-        // still `pending`, so nothing looks different -- and the approval that
-        // lands ratifies a host nobody looked at. Revocation needs no such
-        // check: withdrawing trust is safe whatever the entry now says.
         const body = await readJsonBody(req, maxBodyBytes);
-        const expected = body?.host;
-        if (typeof expected !== "string" || expected.trim() === "") {
+        if (typeof body?.host !== "string" || body.host.trim() === "") {
           throw new RegistryError(
             400,
             "host_required",
             "approve must name the host it is approving",
           );
         }
-        const entry = await store.get(id);
-        if (!entry) {
+        expectedHost = normaliseHost(body.host);
+      }
+
+      // Compared inside the store's lock, against the entry as it is at the
+      // moment of writing. Reading it here and then writing was a race the
+      // check could not win: a registration already in flight moved the host
+      // between the two, and the approval ratified the address the operator
+      // never saw.
+      const entry = await store.mutate(id, (current) => {
+        if (!current) {
           throw new RegistryError(404, "not_found", `no entry with id ${id}`);
         }
-        if (entry.host !== normaliseHost(expected)) {
+        if (expectedHost !== null && current.host !== expectedHost) {
           throw new RegistryError(
             409,
             "entry_changed",
-            `${entry.name} now answers on ${entry.host}, not ${expected}; ` +
-              "review it again before approving",
+            `${current.name} now answers on ${current.host}, not ` +
+              `${expectedHost}; review it again before approving`,
+            { host: current.host },
           );
         }
-      }
-
-      const entry = await store.setState(
-        id,
-        verb === "approve" ? "active" : "revoked",
-      );
+        return {
+          ...current,
+          state: verb === "approve" ? "active" : "revoked",
+        };
+      });
       sendJson(res, 200, { entry });
       return;
     }

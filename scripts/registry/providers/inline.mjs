@@ -110,8 +110,25 @@ export function createInlineProvider({
   // Serialises read-modify-write cycles. `tail` never rejects, so a failed
   // mutation does not wedge the queue for the next caller.
   let tail = Promise.resolve();
+  let held = false;
   function withLock(fn) {
-    const run = tail.then(() => fn());
+    const run = tail.then(async () => {
+      // A nested call would wait on a lock its own caller holds, forever and
+      // silently, taking every later registry write with it.
+      if (held) {
+        throw new RegistryError(
+          500,
+          "reentrant_store_call",
+          "the registry store was re-entered from inside a mutation",
+        );
+      }
+      held = true;
+      try {
+        return await fn();
+      } finally {
+        held = false;
+      }
+    });
     tail = run.then(
       () => undefined,
       () => undefined,
@@ -122,6 +139,46 @@ export function createInlineProvider({
   return {
     list() {
       return readEntries();
+    },
+
+    /**
+     * Read-decide-write, all inside the lock.
+     *
+     * Every other mutation here re-reads under the lock but is handed a
+     * decision that was made *outside* it, against a copy of the entry that
+     * may already be stale. That is a race, not a style choice: an approval
+     * checked the host, then wrote `active` behind an in-flight registration
+     * that had moved it; a revoke landed and was then overwritten by a
+     * registration whose `state` had been computed before it.
+     *
+     * `apply(existing)` runs against the entry as it is at the moment of
+     * writing, so a precondition it checks cannot go stale between the check
+     * and the write. Throwing from `apply` writes nothing.
+     */
+    mutate(id, apply) {
+      return withLock(async () => {
+        const entries = await readEntries();
+        const index = entries.findIndex((entry) => entry.id === id);
+        const existing = index === -1 ? null : entries[index];
+
+        const next = await apply(existing);
+        if (next === undefined) return existing;
+        if (next.id !== id) {
+          throw new RegistryError(
+            500,
+            "invalid_state",
+            "mutate must not change the entry id",
+          );
+        }
+
+        if (index === -1) {
+          entries.push(next);
+        } else {
+          entries[index] = next;
+        }
+        await writeEntries(entries);
+        return next;
+      });
     },
 
     upsert(entry) {

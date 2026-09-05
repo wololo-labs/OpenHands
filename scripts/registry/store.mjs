@@ -46,11 +46,18 @@ const MAX_FIELD_LENGTH = 512;
  * these so `routes.mjs` never has to guess a status.
  */
 export class RegistryError extends Error {
-  constructor(status, code, message) {
+  /**
+   * `details` are extra fields the response body carries alongside the code.
+   * A caller that has to *act* on a refusal needs the particulars -- which
+   * host an entry moved to, say -- and re-deriving them by parsing the prose
+   * message is how a client ends up showing "something went wrong".
+   */
+  constructor(status, code, message, details = null) {
     super(message);
     this.name = "RegistryError";
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -180,6 +187,23 @@ export function createStore(provider) {
     },
     async upsert(entry) {
       const stored = await provider.upsert(normaliseEntry(entry));
+      revision += 1;
+      return stored;
+    },
+
+    /**
+     * Decide and write under the provider's lock.
+     *
+     * `apply(existing)` receives the entry as it is at the moment of writing
+     * and returns the entry to store. Anything it throws aborts the write.
+     * Use this rather than reading with `get()` and then calling
+     * `upsert`/`setState`: between those two the registry can change, and
+     * every precondition checked that way is a race.
+     */
+    async mutate(id, apply) {
+      const stored = await provider.mutate(id, async (existing) =>
+        normaliseEntry(await apply(existing)),
+      );
       revision += 1;
       return stored;
     },

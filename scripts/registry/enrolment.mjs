@@ -258,12 +258,14 @@ function requireBodyString(body, field) {
 /**
  * @param {{
  *   store: {
- *     get(id: string): Promise<any>,
- *     upsert(entry: any): Promise<any>,
+ *     list(): Promise<any[]>,
+ *     mutate(id: string, apply: (existing: any) => any): Promise<any>,
  *   },
  *   allowlist?: string[],
  *   now?: () => number,
  *   replayWindowSeconds?: number,
+ *   maxPendingEntries?: number,
+ *   maxNoncesPerFingerprint?: number,
  * }} options
  */
 export function createEnrolment({
@@ -315,7 +317,16 @@ export function createEnrolment({
     }
   }
 
-  function consumeNonce(fingerprint, nonce, nowMs) {
+  /**
+   * Replay and budget checks, without spending anything.
+   *
+   * Split from the spend so it can run *before* the store is read. A refusal
+   * that happens after the read still costs one full settings fetch from the
+   * agent server per attempt, which is the amplification a flood actually
+   * wants; checking first means a machine over its budget is turned away for
+   * the price of a Map lookup.
+   */
+  function checkNonce(fingerprint, nonce, nowMs) {
     pruneNonces(nowMs);
 
     const key = `${fingerprint}:${nonce}`;
@@ -346,8 +357,24 @@ export function createEnrolment({
         "too many registrations in flight, retry shortly",
       );
     }
+    return key;
+  }
+
+  function spendNonce(fingerprint, nonce, nowMs) {
+    const key = checkNonce(fingerprint, nonce, nowMs);
     seenNonces.set(key, { at: nowMs, fingerprint });
-    nonceCounts.set(fingerprint, spent + 1);
+    nonceCounts.set(fingerprint, (nonceCounts.get(fingerprint) ?? 0) + 1);
+  }
+
+  /** Hands a slot back when the write it was spent on never happened. */
+  function releaseNonce(fingerprint, nonce) {
+    if (!seenNonces.delete(`${fingerprint}:${nonce}`)) return;
+    const remaining = (nonceCounts.get(fingerprint) ?? 1) - 1;
+    if (remaining > 0) {
+      nonceCounts.set(fingerprint, remaining);
+    } else {
+      nonceCounts.delete(fingerprint);
+    }
   }
 
   return {
@@ -382,6 +409,10 @@ export function createEnrolment({
       const fingerprint = fingerprintFromPublicKey(body.pubkey);
       const isPreSeeded = preSeeded.has(fingerprint);
       const id = entryId(fingerprint);
+
+      // Before the store is touched. A caller over its budget, or replaying,
+      // is turned away for a Map lookup rather than a settings fetch.
+      checkNonce(fingerprint, nonce, nowMs);
       // Normalised here rather than left to the store, because the state
       // machine below compares it against what is already stored and a
       // trailing slash is not an address change.
@@ -406,13 +437,13 @@ export function createEnrolment({
         }
       }
 
-      // Shaped and validated before the nonce is spent, not after. Every
-      // remaining way this call can be refused -- an over-long name, a version
-      // string past its limit, anything `normaliseEntry` rejects -- used to
-      // throw *after* `consumeNonce`, so a signed but malformed registration
-      // still cost a slot. Ordering the cap ahead of the nonce closed one such
-      // route and left the rest; validating here closes them as a class.
-      const candidate = normaliseEntry({
+      // Shaped and validated before the nonce is spent, not after. Every way
+      // this call can be refused for its *body* -- an over-long name, a
+      // version string past its limit, anything `normaliseEntry` rejects --
+      // used to throw after the nonce was consumed, so a signed but malformed
+      // registration still cost a slot. `state` here is a placeholder: the
+      // real one is decided under the lock below.
+      normaliseEntry({
         id,
         name: body.name,
         host,
@@ -420,15 +451,46 @@ export function createEnrolment({
         fingerprint,
         credRef: resolveCredRef(existing, fingerprint, body.credRef),
         version: body.version,
-        state: nextState(existing, isPreSeeded, host),
+        state: "pending",
         lastSeen: new Date(nowMs).toISOString(),
       });
 
-      consumeNonce(fingerprint, nonce, nowMs);
+      spendNonce(fingerprint, nonce, nowMs);
 
-      const entry = await store.upsert(candidate);
+      let created = false;
+      let entry;
+      try {
+        // The trust decision is made against the entry as it is at the moment
+        // of writing, not against the copy read above. Deciding outside the
+        // lock let a registration already in flight overwrite an operator's
+        // revoke with a `state` computed before it: revocation did not stick
+        // against a machine that was still re-registering, which is the one
+        // machine it has to stick against.
+        entry = await store.mutate(id, (current) => {
+          created = current === null;
 
-      return { entry, created: existing === null };
+          return {
+            id,
+            name: body.name,
+            host,
+            pubkey: body.pubkey,
+            fingerprint,
+            credRef: resolveCredRef(current, fingerprint, body.credRef),
+            version: body.version,
+            state: nextState(current, isPreSeeded, host),
+            lastSeen: new Date(nowMs).toISOString(),
+          };
+        });
+      } catch (error) {
+        // A write that never happened did not really use its nonce; holding it
+        // would let an agent-server outage burn a node's whole budget and lock
+        // it out of re-enrolling for the rest of the window, exactly when
+        // re-enrolling matters.
+        releaseNonce(fingerprint, nonce);
+        throw error;
+      }
+
+      return { entry, created };
     },
   };
 }

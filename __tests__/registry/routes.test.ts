@@ -415,6 +415,97 @@ describe("registry routes", () => {
     });
   });
 
+  /**
+   * Every other test in this file is sequential, which is why two races
+   * shipped green: the checks were correct read-then-act, and read-then-act
+   * is only correct when nothing else writes in between.
+   */
+  describe("under concurrent registration", () => {
+    async function enrol(
+      registry: Awaited<ReturnType<typeof mountRegistry>>,
+      pubkey: string,
+      privateKey: KeyObject,
+      overrides: Record<string, unknown> = {},
+    ) {
+      const body = registrationBody(pubkey, overrides);
+      return registry.enrolment.register(
+        body,
+        sign(
+          null,
+          Buffer.from(canonicalPayload(body), "utf8"),
+          privateKey,
+        ).toString("base64"),
+      );
+    }
+
+    it("never approves a host the operator did not name", async () => {
+      const registry = await mountRegistry();
+      const { pubkey, privateKey } = makeHostKey();
+      const { entry } = await enrol(registry, pubkey, privateKey);
+      const reviewed = entry.host;
+
+      // The move and the approval are issued together, so the approval can
+      // land on either side of the write.
+      const [, approval] = await Promise.allSettled([
+        enrol(registry, pubkey, privateKey, {
+          host: "https://attacker.example",
+          nonce: "moved",
+        }),
+        json(`${base}/api/registry/${entry.id}/approve`, {
+          method: "POST",
+          headers: {
+            "X-Session-API-Key": SESSION_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ host: reviewed }),
+        }),
+      ]);
+
+      const stored = await registry.store.get(entry.id);
+      const response =
+        approval.status === "fulfilled" ? approval.value : null;
+
+      // The property, stated as the outcome: whichever order the two land in,
+      // the entry is never `active` on an address the operator did not name.
+      // Either the approval lost the race and was refused, or it won and the
+      // move that followed demoted the entry back to the queue.
+      expect(stored).not.toMatchObject({
+        state: "active",
+        host: "https://attacker.example",
+      });
+      if (stored?.state === "active") {
+        expect(stored.host).toBe(reviewed);
+      }
+      expect([200, 409]).toContain(response?.status);
+      if (response?.status === 409) {
+        expect(response.body.error).toBe("entry_changed");
+      }
+    });
+
+    it("never lets a registration undo a revoke", async () => {
+      const registry = await mountRegistry();
+      const { pubkey, privateKey } = makeHostKey();
+      const { entry } = await enrol(registry, pubkey, privateKey);
+
+      await Promise.allSettled([
+        enrol(registry, pubkey, privateKey, { nonce: "inflight" }),
+        json(`${base}/api/registry/${entry.id}/revoke`, {
+          method: "POST",
+          headers: { "X-Session-API-Key": SESSION_KEY },
+        }),
+      ]);
+
+      // A machine being revoked is precisely one that may still be
+      // re-registering, so the revoke has to win once it has landed.
+      const stored = await registry.store.get(entry.id);
+      expect(stored?.state).toBe("revoked");
+
+      // And it stays revoked for everything that follows.
+      await enrol(registry, pubkey, privateKey, { nonce: "after" });
+      expect((await registry.store.get(entry.id))?.state).toBe("revoked");
+    });
+  });
+
   it("accepts an approval that names the host the entry moved to", async () => {
     const registry = await mountRegistry();
     const { pubkey, privateKey } = makeHostKey();
