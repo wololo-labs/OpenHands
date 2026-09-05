@@ -104,13 +104,17 @@ the whole of it. An entry that already exists skips the pending cap, so with a
 shared bound one enrolled keypair could re-register with fresh nonces until
 the table was full and every other machine's enrolment answered "too many in
 flight". Per identity, a flood spends the flooder's own budget and earns a
-`429` that names them. No refusal holds a slot, whatever the reason: the entry
-is validated into its stored shape before the nonce is spent, and a
-registration whose write then fails -- because a cap refused it, or because
-the agent server was unreachable -- hands its slot straight back. Only a
-registration that was written keeps one. Charging a refusal would read as
-making a flood pay and do the reverse: the flooder spends a throwaway keypair
-per attempt, while the slots come out of a table the whole fleet shares.
+`429` that names them. A slot is spent only once the entry has been written,
+so no refusal holds one and neither does a registration that is merely in
+flight -- a cap refusal, a malformed body and an unreachable agent server all
+leave the table as they found it. Charging a refusal would read as making a
+flood pay and do the reverse: the flooder spends a throwaway keypair per
+attempt, while the slots come out of a table the whole fleet shares.
+
+Nothing before that decision touches the store either. The body is validated
+into its stored shape against itself, so a signed but malformed registration
+costs a `JSON.parse` rather than a settings fetch, and the single read the
+call makes is the one inside the lock that writes.
 
 The nonce set is process-local, so an ingress restart forgets it and a
 captured registration is replayable for the remainder of its window.

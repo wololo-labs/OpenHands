@@ -379,21 +379,16 @@ export function createEnrolment({
     return key;
   }
 
+  /**
+   * Records a nonce as spent. Deliberately does not re-check: it runs after
+   * the write, and a duplicate arriving in parallel must not turn an entry
+   * that was stored into an error.
+   */
   function spendNonce(fingerprint, nonce, nowMs) {
-    const key = checkNonce(fingerprint, nonce, nowMs);
+    const key = `${fingerprint}:${nonce}`;
+    if (seenNonces.has(key)) return;
     seenNonces.set(key, { at: nowMs, fingerprint });
     nonceCounts.set(fingerprint, (nonceCounts.get(fingerprint) ?? 0) + 1);
-  }
-
-  /** Hands a slot back when the write it was spent on never happened. */
-  function releaseNonce(fingerprint, nonce) {
-    if (!seenNonces.delete(`${fingerprint}:${nonce}`)) return;
-    const remaining = (nonceCounts.get(fingerprint) ?? 1) - 1;
-    if (remaining > 0) {
-      nonceCounts.set(fingerprint, remaining);
-    } else {
-      nonceCounts.delete(fingerprint);
-    }
   }
 
   return {
@@ -436,96 +431,89 @@ export function createEnrolment({
       // machine below compares it against what is already stored and a
       // trailing slash is not an address change.
       const host = normaliseHost(body.host);
-      const existing = await store.get(id);
 
-      // Shaped and validated before the nonce is spent, not after. Every way
-      // this call can be refused for its *body* -- an over-long name, a
-      // version string past its limit, anything `normaliseEntry` rejects --
-      // used to throw after the nonce was consumed, so a signed but malformed
-      // registration still cost a slot. `state` here is a placeholder: the
-      // real one is decided under the lock below.
+      // Shaped and validated before the store is read at all. Every way this
+      // call can be refused for its *body* -- an over-long name, a version
+      // string past its limit, anything `normaliseEntry` rejects -- is
+      // settled against the body alone, so a malformed registration costs a
+      // `JSON.parse` and not a settings fetch. `state` and `credRef` here are
+      // placeholders of the right shape: the real ones are decided under the
+      // lock below, against the entry as it is then.
       normaliseEntry({
         id,
         name: body.name,
         host,
         pubkey: body.pubkey,
         fingerprint,
-        credRef: resolveCredRef(existing, fingerprint, body.credRef),
+        credRef: credRefFor(fingerprint),
         version: body.version,
         state: "pending",
         lastSeen: new Date(nowMs).toISOString(),
       });
 
-      spendNonce(fingerprint, nonce, nowMs);
-
       let created = false;
-      let entry;
-      try {
-        // The trust decision is made against the entry as it is at the moment
-        // of writing, not against the copy read above. Deciding outside the
-        // lock let a registration already in flight overwrite an operator's
-        // revoke with a `state` computed before it: revocation did not stick
-        // against a machine that was still re-registering, which is the one
-        // machine it has to stick against.
-        entry = await store.mutate(id, (current, entries) => {
-          created = current === null;
+      // The trust decision is made against the entry as it is at the moment
+      // of writing, rather than against a copy read beforehand. Deciding
+      // outside the
+      // lock let a registration already in flight overwrite an operator's
+      // revoke with a `state` computed before it: revocation did not stick
+      // against a machine that was still re-registering, which is the one
+      // machine it has to stick against.
+      const entry = await store.mutate(id, (current, entries) => {
+        created = current === null;
 
-          // Capped here rather than before the write, for the same reason the
-          // trust decision is: a count read beforehand is a count a burst
-          // arriving in parallel has already invalidated. Checked outside the
-          // lock, forty concurrent registrations put eighteen entries past a
-          // cap of three.
-          //
-          // Only a *new* entry is capped. A machine already listed, and one
-          // whose fingerprint is pre-seeded, always gets through, so a flood
-          // cannot lock out the fleet it is trying to drown.
-          if (created && !isPreSeeded) {
-            if (entries.length >= maxEntries) {
-              throw new RegistryError(
-                429,
-                "too_many_entries",
-                `the registry holds ${entries.length} entries; ` +
-                  "remove some before enrolling another machine",
-              );
-            }
-            const pending = entries.filter(
-              (entry) => entry.state === "pending",
-            ).length;
-            if (pending >= maxPendingEntries) {
-              throw new RegistryError(
-                429,
-                "too_many_pending",
-                `${pending} registrations are already awaiting approval; ` +
-                  "approve or revoke some before enrolling another machine",
-              );
-            }
+        // Capped here rather than before the write, for the same reason the
+        // trust decision is: a count read beforehand is a count a burst
+        // arriving in parallel has already invalidated. Checked outside the
+        // lock, forty concurrent registrations put eighteen entries past a
+        // cap of three.
+        //
+        // Only a *new* entry is capped. A machine already listed, and one
+        // whose fingerprint is pre-seeded, always gets through, so a flood
+        // cannot lock out the fleet it is trying to drown.
+        if (created && !isPreSeeded) {
+          if (entries.length >= maxEntries) {
+            throw new RegistryError(
+              429,
+              "too_many_entries",
+              `the registry holds ${entries.length} entries; ` +
+                "remove some before enrolling another machine",
+            );
           }
+          const pending = entries.filter(
+            (entry) => entry.state === "pending",
+          ).length;
+          if (pending >= maxPendingEntries) {
+            throw new RegistryError(
+              429,
+              "too_many_pending",
+              `${pending} registrations are already awaiting approval; ` +
+                "approve or revoke some before enrolling another machine",
+            );
+          }
+        }
 
-          return {
-            id,
-            name: body.name,
-            host,
-            pubkey: body.pubkey,
-            fingerprint,
-            credRef: resolveCredRef(current, fingerprint, body.credRef),
-            version: body.version,
-            state: nextState(current, isPreSeeded, host),
-            lastSeen: new Date(nowMs).toISOString(),
-          };
-        });
-      } catch (error) {
-        // Every failure hands the slot back, cap refusals included. The slot
-        // is in a table shared by the whole fleet, and a flood spends a fresh
-        // fingerprint per attempt, so charging it costs the attacker nothing
-        // and fills the table for everyone else: refuse a hundred thousand
-        // registrations by the entry cap and the next real node is told
-        // `nonce_table_full`. Holding a slot for a write that never happened
-        // also lets an agent-server outage burn a node's budget and lock it
-        // out of re-enrolling for the rest of the window, exactly when
-        // re-enrolling matters.
-        releaseNonce(fingerprint, nonce);
-        throw error;
-      }
+        return {
+          id,
+          name: body.name,
+          host,
+          pubkey: body.pubkey,
+          fingerprint,
+          credRef: resolveCredRef(current, fingerprint, body.credRef),
+          version: body.version,
+          state: nextState(current, isPreSeeded, host),
+          lastSeen: new Date(nowMs).toISOString(),
+        };
+      });
+
+      // Spent only once the write has happened, so nothing that is merely in
+      // flight holds one. The slot comes out of a table the whole fleet
+      // shares, and a flood spends a throwaway keypair per attempt: charging
+      // for a refusal, or holding a slot for the length of a queued write,
+      // costs the flooder nothing and fills the table for everyone else. What
+      // can be held at once is now bounded by the entry cap, because only an
+      // entry that exists can have spent anything.
+      spendNonce(fingerprint, nonce, nowMs);
 
       return { entry, created };
     },

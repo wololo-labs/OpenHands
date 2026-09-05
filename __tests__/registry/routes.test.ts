@@ -54,6 +54,8 @@ function createFakeAgentServer() {
     misc_settings: { app_preferences: { language: "en" } },
   };
 
+  const reads: string[] = [];
+
   const server = createServer((req, res) => {
     void (async () => {
       if (req.headers["x-session-api-key"] !== SESSION_KEY) {
@@ -64,6 +66,7 @@ function createFakeAgentServer() {
         res.writeHead(404).end();
         return;
       }
+      reads.push(req.method ?? "");
       if (req.method === "PATCH") {
         const diff = JSON.parse(await readBody(req)).misc_settings_diff ?? {};
         state.misc_settings = { ...state.misc_settings, ...diff };
@@ -73,7 +76,7 @@ function createFakeAgentServer() {
     })();
   });
 
-  return { server, state };
+  return { server, state, reads };
 }
 
 function sshPublicKeyLine(publicKey: KeyObject) {
@@ -696,6 +699,36 @@ describe("registry routes", () => {
 
     expect(response.status).toBe(200);
     expect(response.body.entry.state).toBe("active");
+  });
+
+  it("refuses a malformed registration without reading the store", async () => {
+    // The registration route is unauthenticated, so the work it does before
+    // it decides is the amplification: a signed body with an over-long name
+    // used to cost a full settings fetch each time, and nothing stops a
+    // caller sending the same one repeatedly.
+    await mountRegistry();
+    const { pubkey, privateKey } = makeHostKey();
+    const body = registrationBody(pubkey, { name: "n".repeat(600) });
+    const signature = sign(
+      null,
+      Buffer.from(canonicalPayload(body), "utf8"),
+      privateKey,
+    ).toString("base64");
+    agentServer.reads.length = 0;
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const response = await json(`${base}/api/registry/register`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Registry-Signature": signature,
+        },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(400);
+    }
+
+    expect(agentServer.reads).toEqual([]);
   });
 
   it("returns 405 for the wrong method and 404 for an unknown route", async () => {
