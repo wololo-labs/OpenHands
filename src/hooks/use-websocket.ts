@@ -49,9 +49,11 @@ export const useWebSocket = (url: string, options?: WebSocketHookOptions) => {
   const connectWebSocket = React.useCallback(() => {
     // Build URL with query parameters if provided
     let wsUrl = url;
-    if (optionsRef.current?.queryParams) {
+    // Key count, not truthiness: an empty `queryParams` must not append a
+    // bare `?` to the handshake URL.
+    if (Object.keys(optionsRef.current?.queryParams ?? {}).length > 0) {
       const stringParams = Object.entries(
-        optionsRef.current.queryParams,
+        optionsRef.current?.queryParams ?? {},
       ).reduce(
         (acc, [key, value]) => {
           acc[key] = String(value);

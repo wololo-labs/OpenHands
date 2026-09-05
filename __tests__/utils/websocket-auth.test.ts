@@ -14,13 +14,10 @@ import {
 describe("resolveWebSocketAuth", () => {
   const KEY = "the-origins-session-key";
   const fleetConversation = `${window.location.origin}/backend/abc123/api/conversations/x`;
+  const fleetSocket = `ws://${window.location.host}/backend/abc123/sockets/events`;
 
   it("moves the key onto the handshake for a fleet backend", () => {
-    const auth = resolveWebSocketAuth(
-      "ws://canvas.example/backend/abc123/sockets/events",
-      fleetConversation,
-      KEY,
-    );
+    const auth = resolveWebSocketAuth(fleetSocket, fleetConversation, KEY);
 
     expect(auth.url).toContain(`session_api_key=${encodeURIComponent(KEY)}`);
     expect(auth.sendFrame).toBe(false);
@@ -28,7 +25,7 @@ describe("resolveWebSocketAuth", () => {
 
   it("appends to an existing query string rather than replacing it", () => {
     const auth = resolveWebSocketAuth(
-      "ws://canvas.example/backend/abc123/sockets/events?resend_mode=all",
+      `${fleetSocket}?resend_mode=all`,
       fleetConversation,
       KEY,
     );
@@ -39,12 +36,12 @@ describe("resolveWebSocketAuth", () => {
 
   it("leaves a non-fleet socket on the frame, untouched", () => {
     const auth = resolveWebSocketAuth(
-      "ws://canvas.example/sockets/events",
-      "http://canvas.example",
+      `ws://${window.location.host}/sockets/events`,
+      window.location.origin,
       KEY,
     );
 
-    expect(auth.url).toBe("ws://canvas.example/sockets/events");
+    expect(auth.url).toBe(`ws://${window.location.host}/sockets/events`);
     expect(auth.sendFrame).toBe(true);
   });
 
@@ -62,9 +59,22 @@ describe("resolveWebSocketAuth", () => {
   });
 
   it("adds nothing when there is no key to present", () => {
-    const auth = resolveWebSocketAuth("ws://x/y", fleetConversation, null);
+    const auth = resolveWebSocketAuth(fleetSocket, fleetConversation, null);
 
-    expect(auth.url).toBe("ws://x/y");
+    expect(auth.url).toBe(fleetSocket);
+    expect(auth.sendFrame).toBe(true);
+  });
+
+  it("refuses to put the key in a socket URL on another host", () => {
+    // The two-URL signature can express a fleet conversation alongside a
+    // foreign socket. Neither caller does, and this makes sure none can start.
+    const auth = resolveWebSocketAuth(
+      "ws://elsewhere.example/backend/abc123/sockets",
+      fleetConversation,
+      KEY,
+    );
+
+    expect(auth.url).not.toContain("session_api_key");
     expect(auth.sendFrame).toBe(true);
   });
 });
