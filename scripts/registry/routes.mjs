@@ -5,6 +5,7 @@
  *   POST   /api/registry/register   signed enrolment      (signature auth)
  *   POST   /api/registry/:id/approve  { host }            (session-key auth)
  *   POST   /api/registry/:id/revoke                       (session-key auth)
+ *   DELETE /api/registry/:id          forget an entry     (session-key auth)
  *
  * Approve names the host it is approving and answers 409 if the entry has
  * moved since, so the decision is bound to what the operator actually read.
@@ -211,6 +212,36 @@ export function createRegistry({
         };
       });
       sendJson(res, 200, { entry });
+      return;
+    }
+
+    // Revocation withdraws trust but keeps the entry, which is right for an
+    // operator decision and wrong for junk: a flood's leavings would sit in
+    // the settings document forever, read in full on every registration.
+    const entryPath = pathname.match(/^\/api\/registry\/([^/]+)$/);
+    if (entryPath && method === "DELETE") {
+      requireSessionKey(req);
+      const [, id] = entryPath;
+      const existing = await store.get(id);
+      if (!existing) {
+        throw new RegistryError(404, "not_found", `no entry with id ${id}`);
+      }
+      // A revoked entry is the record of a decision, not junk. Forgetting one
+      // un-revokes the machine: the next registration sees no entry, so it
+      // enrols afresh -- straight back to `active` if its fingerprint is
+      // pre-seeded. Tidying up after a flood would quietly re-arm every host
+      // an operator had decommissioned, which is the opposite of "revocation
+      // is final". What a flood leaves behind is `pending`, and that deletes.
+      if (existing.state === "revoked") {
+        throw new RegistryError(
+          409,
+          "entry_revoked",
+          `${existing.name} is revoked, and revoked entries are kept on ` +
+            "purpose; approve it if you want it back",
+        );
+      }
+      await store.remove(id);
+      sendJson(res, 200, { id });
       return;
     }
 

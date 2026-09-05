@@ -5,7 +5,10 @@ import { http, passthrough } from "msw";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { server as mswServer } from "#/mocks/node";
-import { canonicalPayload } from "../../scripts/registry/enrolment.mjs";
+import {
+  canonicalPayload,
+  fingerprintFromPublicKey,
+} from "../../scripts/registry/enrolment.mjs";
 import {
   createRegistry,
   isRegistryRequest,
@@ -417,6 +420,91 @@ describe("registry routes", () => {
     expect(await registry.store.get(entry.id)).toMatchObject({
       state: "pending",
     });
+  });
+
+  it("forgets an entry on DELETE, and 404s one that is not there", async () => {
+    // Revoking withdraws trust but keeps the entry. That is right for an
+    // operator decision and wrong for a flood's leavings, which would
+    // otherwise sit in the settings document forever.
+    const registry = await mountRegistry();
+    const { pubkey, privateKey } = makeHostKey();
+    const body = registrationBody(pubkey);
+    const { entry } = await registry.enrolment.register(
+      body,
+      sign(
+        null,
+        Buffer.from(canonicalPayload(body), "utf8"),
+        privateKey,
+      ).toString("base64"),
+    );
+    const auth = { "X-Session-API-Key": SESSION_KEY };
+
+    const removed = await json(`${base}/api/registry/${entry.id}`, {
+      method: "DELETE",
+      headers: auth,
+    });
+    expect(removed.status).toBe(200);
+    expect(await registry.store.list()).toEqual([]);
+
+    const again = await json(`${base}/api/registry/${entry.id}`, {
+      method: "DELETE",
+      headers: auth,
+    });
+    expect(again.status).toBe(404);
+  });
+
+  it("keeps a revoked entry when DELETE tries to forget it", async () => {
+    // Deleting a revoked entry un-revokes the machine: the next registration
+    // finds nothing and enrols afresh, straight back to `active` when the
+    // fingerprint is pre-seeded.
+    const { pubkey, privateKey } = makeHostKey();
+    const fingerprint = fingerprintFromPublicKey(pubkey);
+    const registry = await mountRegistry([fingerprint]);
+    const body = registrationBody(pubkey);
+    const signature = sign(
+      null,
+      Buffer.from(canonicalPayload(body), "utf8"),
+      privateKey,
+    ).toString("base64");
+    const { entry } = await registry.enrolment.register(body, signature);
+    const auth = { "X-Session-API-Key": SESSION_KEY };
+
+    await json(`${base}/api/registry/${entry.id}/revoke`, {
+      method: "POST",
+      headers: auth,
+    });
+
+    const removed = await json(`${base}/api/registry/${entry.id}`, {
+      method: "DELETE",
+      headers: auth,
+    });
+
+    expect(removed.status).toBe(409);
+    expect(removed.body.error).toBe("entry_revoked");
+
+    // The outcome that matters: the machine cannot get back in by re-enrolling.
+    const again = registrationBody(pubkey, { nonce: "after-delete" });
+    await registry.enrolment.register(
+      again,
+      sign(
+        null,
+        Buffer.from(canonicalPayload(again), "utf8"),
+        privateKey,
+      ).toString("base64"),
+    );
+    expect(await registry.store.get(entry.id)).toMatchObject({
+      state: "revoked",
+    });
+  });
+
+  it("refuses a DELETE without the session key", async () => {
+    await mountRegistry();
+
+    const response = await json(`${base}/api/registry/anything`, {
+      method: "DELETE",
+    });
+
+    expect(response.status).toBe(401);
   });
 
   /**

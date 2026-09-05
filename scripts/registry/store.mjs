@@ -18,7 +18,7 @@
  *
  *   list()             -> entry[]
  *   upsert(entry)      -> entry
- *   remove(id)         -> void
+ *   remove(id)         -> boolean (whether an entry went)
  *   setState(id, state)-> entry
  *
  * `createStore()` wraps a provider with validation and a `get()` helper, so

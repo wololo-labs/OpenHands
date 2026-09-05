@@ -199,13 +199,14 @@ export function createInlineProvider({
       });
     },
 
+    /** Returns whether an entry was actually removed. */
     remove(id) {
       return withLock(async () => {
         const entries = await readEntries();
         const next = entries.filter((entry) => entry.id !== id);
-        if (next.length !== entries.length) {
-          await writeEntries(next);
-        }
+        if (next.length === entries.length) return false;
+        await writeEntries(next);
+        return true;
       });
     },
 
