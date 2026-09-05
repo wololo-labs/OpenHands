@@ -32,6 +32,7 @@ function createMemoryProvider(): {
     id: string,
     apply: (
       existing: Entry | null,
+      entries: Entry[],
     ) => Promise<Entry | undefined> | Entry | undefined,
   ) => Promise<Entry | null>;
   remove: (id: string) => Promise<void>;
@@ -48,7 +49,7 @@ function createMemoryProvider(): {
     },
     async mutate(id, apply) {
       const existing = entries.get(id) ?? null;
-      const next = await apply(existing);
+      const next = await apply(existing, [...entries.values()]);
       if (next === undefined) return existing;
       entries.set(id, next);
       return next;
@@ -779,21 +780,28 @@ describe("a refused registration does not spend a nonce slot", () => {
    * for a registration the same call is about to refuse lets a flood fill it
    * and 503 the enrolments that would have been accepted.
    */
-  it("leaves the table intact when the pending cap refuses a registration", async () => {
-    const { enrolment } = makeEnrolment([], { maxPendingEntries: 0 });
+  it("charges the caller for knocking on a full queue", async () => {
+    // Deliberately *not* free. A registration refused by the pending cap has
+    // already cost a settings read, so letting a fresh keypair knock without
+    // limit is the amplification the cap is supposed to remove.
+    const { enrolment } = makeEnrolment([], {
+      maxPendingEntries: 0,
+      maxNoncesPerFingerprint: 2,
+    });
     const node = makeHostKey();
-    const body = makeBody(node.pubkey, { nonce: "reused" });
-    const signature = signBody(body, node.privateKey);
 
-    await expect(enrolment.register(body, signature)).rejects.toMatchObject({
-      status: 429,
-    });
+    for (const nonce of ["a", "b"]) {
+      const body = makeBody(node.pubkey, { nonce });
+      await expect(
+        enrolment.register(body, signBody(body, node.privateKey)),
+      ).rejects.toMatchObject({ code: "too_many_pending" });
+    }
 
-    // The nonce is still spendable: the rejection above cost nothing. It is
-    // the cap that refuses this too, never `replayed_nonce`.
-    await expect(enrolment.register(body, signature)).rejects.toMatchObject({
-      code: "too_many_pending",
-    });
+    // Budget spent: the next attempt is turned away before the store is read.
+    const third = makeBody(node.pubkey, { nonce: "c" });
+    await expect(
+      enrolment.register(third, signBody(third, node.privateKey)),
+    ).rejects.toMatchObject({ code: "too_many_registrations" });
   });
 
   it("hands the slot back when the write itself fails", async () => {
@@ -865,5 +873,60 @@ describe("a refused registration does not spend a nonce slot", () => {
       status: 401,
       code: "replayed_nonce",
     });
+  });
+});
+
+describe("the registry is bounded in total, not just in the queue", () => {
+  /**
+   * The pending cap bounds the queue, not the store. Revoking the junk -- the
+   * natural response to a flood -- frees the gauge and lets it refill, and
+   * every revoked entry stays in `misc_settings` forever, read in full on
+   * every registration and every proxied request.
+   */
+  it("refuses a new machine once the store is full, whatever the states are", async () => {
+    const { store, enrolment } = makeEnrolment([], {
+      maxEntries: 3,
+      maxPendingEntries: 100,
+    });
+
+    const enrolled = [];
+    for (let index = 0; index < 3; index += 1) {
+      const node = makeHostKey();
+      const body = makeBody(node.pubkey, {
+        name: `n${index}`,
+        nonce: `n${index}`,
+      });
+      const { entry } = await enrolment.register(
+        body,
+        signBody(body, node.privateKey),
+      );
+      enrolled.push(entry);
+    }
+
+    // Revoking frees the *pending* gauge but not the store.
+    for (const entry of enrolled) {
+      await store.setState(entry.id, "revoked");
+    }
+
+    const extra = makeHostKey();
+    const body = makeBody(extra.pubkey, { name: "extra", nonce: "x" });
+    await expect(
+      enrolment.register(body, signBody(body, extra.privateKey)),
+    ).rejects.toMatchObject({ status: 429, code: "too_many_entries" });
+
+    expect(await store.list()).toHaveLength(3);
+  });
+
+  it("still lets a machine that is already listed re-announce", async () => {
+    const { enrolment } = makeEnrolment([], { maxEntries: 1 });
+    const node = makeHostKey();
+
+    const first = makeBody(node.pubkey, { nonce: "1" });
+    await enrolment.register(first, signBody(first, node.privateKey));
+
+    const again = makeBody(node.pubkey, { nonce: "2" });
+    await expect(
+      enrolment.register(again, signBody(again, node.privateKey)),
+    ).resolves.toMatchObject({ created: false });
   });
 });

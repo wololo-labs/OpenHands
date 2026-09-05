@@ -151,9 +151,13 @@ export function createInlineProvider({
      * that had moved it; a revoke landed and was then overwritten by a
      * registration whose `state` had been computed before it.
      *
-     * `apply(existing)` runs against the entry as it is at the moment of
-     * writing, so a precondition it checks cannot go stale between the check
-     * and the write. Throwing from `apply` writes nothing.
+     * `apply(existing, entries)` runs against the entry -- and the whole entry
+     * list -- as they are at the moment of writing, so a precondition it
+     * checks cannot go stale between the check and the write. The list is
+     * passed because some preconditions are about the registry as a whole
+     * (how many entries there are, how many await approval) and those race
+     * exactly like the per-entry ones do. Throwing from `apply` writes
+     * nothing.
      */
     mutate(id, apply) {
       return withLock(async () => {
@@ -161,7 +165,7 @@ export function createInlineProvider({
         const index = entries.findIndex((entry) => entry.id === id);
         const existing = index === -1 ? null : entries[index];
 
-        const next = await apply(existing);
+        const next = await apply(existing, entries);
         if (next === undefined) return existing;
         if (next.id !== id) {
           throw new RegistryError(

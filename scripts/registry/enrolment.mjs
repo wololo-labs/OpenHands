@@ -55,6 +55,17 @@ export const DEFAULT_REPLAY_WINDOW_SECONDS = 300;
  */
 export const DEFAULT_MAX_PENDING_ENTRIES = 100;
 /**
+ * Ceiling on entries of any state.
+ *
+ * The pending cap alone bounds the queue, not the store: revoking the junk --
+ * the natural response to a flood -- frees the gauge and lets it refill, and
+ * every revoked entry stays in `misc_settings` forever, read in full on every
+ * registration and every proxied request. Bounding the total is what stops a
+ * flood leaving a permanently fat settings document behind. Well past any
+ * real fleet; an operator who reaches it has junk to delete.
+ */
+export const DEFAULT_MAX_ENTRIES = 500;
+/**
  * Nonces one fingerprint may spend inside a replay window.
  *
  * The table has to be bounded, and bounding it *globally* is what made it a
@@ -72,6 +83,8 @@ export const DEFAULT_MAX_NONCES_PER_FINGERPRINT = 32;
  * fingerprint has to get past the pending cap before it can spend anything.
  */
 const MAX_TRACKED_NONCES = 100_000;
+/** Refusals that keep the nonce they were charged. See `register`. */
+const CHARGED_REFUSALS = new Set(["too_many_entries", "too_many_pending"]);
 const SSH_ED25519 = "ssh-ed25519";
 const ED25519_RAW_KEY_BYTES = 32;
 const ED25519_SIGNATURE_BYTES = 64;
@@ -266,6 +279,7 @@ function requireBodyString(body, field) {
  *   replayWindowSeconds?: number,
  *   maxPendingEntries?: number,
  *   maxNoncesPerFingerprint?: number,
+ *   maxEntries?: number,
  * }} options
  */
 export function createEnrolment({
@@ -275,6 +289,7 @@ export function createEnrolment({
   replayWindowSeconds = DEFAULT_REPLAY_WINDOW_SECONDS,
   maxPendingEntries = DEFAULT_MAX_PENDING_ENTRIES,
   maxNoncesPerFingerprint = DEFAULT_MAX_NONCES_PER_FINGERPRINT,
+  maxEntries = DEFAULT_MAX_ENTRIES,
 }) {
   const preSeeded = new Set(
     allowlist.map(normaliseFingerprint).filter((value) => value !== null),
@@ -417,25 +432,7 @@ export function createEnrolment({
       // machine below compares it against what is already stored and a
       // trailing slash is not an address change.
       const host = normaliseHost(body.host);
-      const entries = await store.list();
-      const existing = entries.find((entry) => entry.id === id) ?? null;
-
-      // Only a *new* entry that would land pending is capped. A machine that is
-      // already listed, and one whose fingerprint is pre-seeded, always gets
-      // through, so a flood cannot lock out the fleet it is trying to drown.
-      if (!existing && !isPreSeeded) {
-        const pending = entries.filter(
-          (entry) => entry.state === "pending",
-        ).length;
-        if (pending >= maxPendingEntries) {
-          throw new RegistryError(
-            429,
-            "too_many_pending",
-            `${pending} registrations are already awaiting approval; ` +
-              "approve or revoke some before enrolling another machine",
-          );
-        }
-      }
+      const existing = await store.get(id);
 
       // Shaped and validated before the nonce is spent, not after. Every way
       // this call can be refused for its *body* -- an over-long name, a
@@ -466,8 +463,39 @@ export function createEnrolment({
         // revoke with a `state` computed before it: revocation did not stick
         // against a machine that was still re-registering, which is the one
         // machine it has to stick against.
-        entry = await store.mutate(id, (current) => {
+        entry = await store.mutate(id, (current, entries) => {
           created = current === null;
+
+          // Capped here rather than before the write, for the same reason the
+          // trust decision is: a count read beforehand is a count a burst
+          // arriving in parallel has already invalidated. Checked outside the
+          // lock, forty concurrent registrations put eighteen entries past a
+          // cap of three.
+          //
+          // Only a *new* entry is capped. A machine already listed, and one
+          // whose fingerprint is pre-seeded, always gets through, so a flood
+          // cannot lock out the fleet it is trying to drown.
+          if (created && !isPreSeeded) {
+            if (entries.length >= maxEntries) {
+              throw new RegistryError(
+                429,
+                "too_many_entries",
+                `the registry holds ${entries.length} entries; ` +
+                  "remove some before enrolling another machine",
+              );
+            }
+            const pending = entries.filter(
+              (entry) => entry.state === "pending",
+            ).length;
+            if (pending >= maxPendingEntries) {
+              throw new RegistryError(
+                429,
+                "too_many_pending",
+                `${pending} registrations are already awaiting approval; ` +
+                  "approve or revoke some before enrolling another machine",
+              );
+            }
+          }
 
           return {
             id,
@@ -486,7 +514,13 @@ export function createEnrolment({
         // would let an agent-server outage burn a node's whole budget and lock
         // it out of re-enrolling for the rest of the window, exactly when
         // re-enrolling matters.
-        releaseNonce(fingerprint, nonce);
+        //
+        // A cap refusal is the exception, and deliberately so: knocking on a
+        // full registry costs a settings read, so it has to cost the caller
+        // something too.
+        if (!CHARGED_REFUSALS.has(error?.code)) {
+          releaseNonce(fingerprint, nonce);
+        }
         throw error;
       }
 

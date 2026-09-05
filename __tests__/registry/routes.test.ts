@@ -136,12 +136,16 @@ describe("registry routes", () => {
   let base: string;
 
   /** Mounts a registry the way scripts/ingress.mjs does. */
-  async function mountRegistry(preSeededFingerprints: string[] = []) {
+  async function mountRegistry(
+    preSeededFingerprints: string[] = [],
+    limits: { maxEntries?: number; maxPendingEntries?: number } = {},
+  ) {
     const registry = createRegistry({
       agentServerUrl,
       sessionKey: SESSION_KEY,
       preSeededFingerprints,
       now: () => NOW_MS,
+      ...limits,
     });
     ingress = createServer((req, res) => {
       if (isRegistryRequest(req)) {
@@ -480,6 +484,44 @@ describe("registry routes", () => {
       if (response?.status === 409) {
         expect(response.body.error).toBe("entry_changed");
       }
+    });
+
+    it("holds the entry cap against a burst", async () => {
+      // The caps used to be read outside the store's lock and enforced
+      // inside it, which is no enforcement at all: forty registrations
+      // arriving together each read the same count and each passed.
+      const registry = await mountRegistry([], { maxEntries: 3 });
+
+      const keys = Array.from({ length: 40 }, () => makeHostKey());
+      await Promise.allSettled(
+        keys.map((key, index) =>
+          enrol(registry, key.pubkey, key.privateKey, {
+            name: `n${index}`,
+            nonce: `n${index}`,
+          }),
+        ),
+      );
+
+      expect(await registry.store.list()).toHaveLength(3);
+    });
+
+    it("holds the pending cap against a burst", async () => {
+      const registry = await mountRegistry([], { maxPendingEntries: 2 });
+
+      const keys = Array.from({ length: 40 }, () => makeHostKey());
+      await Promise.allSettled(
+        keys.map((key, index) =>
+          enrol(registry, key.pubkey, key.privateKey, {
+            name: `p${index}`,
+            nonce: `p${index}`,
+          }),
+        ),
+      );
+
+      const pending = (await registry.store.list()).filter(
+        (entry: { state: string }) => entry.state === "pending",
+      );
+      expect(pending).toHaveLength(2);
     });
 
     it("never lets a registration undo a revoke", async () => {

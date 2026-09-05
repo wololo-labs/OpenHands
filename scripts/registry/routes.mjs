@@ -103,6 +103,9 @@ export function createRegistry({
     fetchImpl,
   }),
   now,
+  maxPendingEntries,
+  maxNoncesPerFingerprint,
+  maxEntries,
 }) {
   if (!sessionKey) {
     throw new Error("createRegistry requires sessionKey");
@@ -113,6 +116,15 @@ export function createRegistry({
     store,
     allowlist: preSeededFingerprints,
     ...(now ? { now } : {}),
+    // Named rather than rest-spread: a spread also forwards `store` and
+    // `allowlist`, so a caller could hand the enrolment a different store than
+    // the routes read from and every registration would "succeed" into
+    // nowhere.
+    ...(maxPendingEntries !== undefined ? { maxPendingEntries } : {}),
+    ...(maxNoncesPerFingerprint !== undefined
+      ? { maxNoncesPerFingerprint }
+      : {}),
+    ...(maxEntries !== undefined ? { maxEntries } : {}),
   });
 
   function requireSessionKey(req) {

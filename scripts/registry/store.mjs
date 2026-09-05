@@ -194,22 +194,24 @@ export function createStore(provider) {
     /**
      * Decide and write under the provider's lock.
      *
-     * `apply(existing)` receives the entry as it is at the moment of writing
-     * and returns the entry to store. Anything it throws aborts the write.
-     * Use this rather than reading with `get()` and then calling
-     * `upsert`/`setState`: between those two the registry can change, and
-     * every precondition checked that way is a race.
+     * `apply(existing, entries)` receives the entry, and the whole entry list,
+     * as they are at the moment of writing, and returns the entry to store.
+     * Anything it throws aborts the write. Use this rather than reading with
+     * `get()`/`list()` and then calling `upsert`/`setState`: between those two
+     * the registry can change, and every precondition checked that way is a
+     * race -- whether it is about one entry or about how many there are.
      */
     async mutate(id, apply) {
-      const stored = await provider.mutate(id, async (existing) =>
-        normaliseEntry(await apply(existing)),
+      const stored = await provider.mutate(id, async (existing, entries) =>
+        normaliseEntry(await apply(existing, entries)),
       );
       revision += 1;
       return stored;
     },
     async remove(id) {
+      const before = (await provider.list()).length;
       const removed = await provider.remove(id);
-      revision += 1;
+      if ((await provider.list()).length !== before) revision += 1;
       return removed;
     },
     async setState(id, state) {
