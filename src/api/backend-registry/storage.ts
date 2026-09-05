@@ -53,7 +53,8 @@ function isValidBackend(value: unknown): value is Backend {
         Number.isSafeInteger(v.connectionRevision) &&
         v.connectionRevision >= 0)) &&
     isValidProvenance(v.provenance) &&
-    isValidRegistryState(v.registryState)
+    isValidRegistryState(v.registryState) &&
+    (v.registryHost === undefined || typeof v.registryHost === "string")
   );
 }
 

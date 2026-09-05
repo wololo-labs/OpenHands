@@ -18,7 +18,8 @@
  *
  *   list()             -> entry[]
  *   upsert(entry)      -> entry
- *   remove(id)         -> void
+ *   remove(id)         -> boolean (whether an entry went)
+ *   removeIf(id, check) -> boolean (check throws to refuse, under the lock)
  *   setState(id, state)-> entry
  *
  * `createStore()` wraps a provider with validation and a `get()` helper, so
@@ -46,11 +47,18 @@ const MAX_FIELD_LENGTH = 512;
  * these so `routes.mjs` never has to guess a status.
  */
 export class RegistryError extends Error {
-  constructor(status, code, message) {
+  /**
+   * `details` are extra fields the response body carries alongside the code.
+   * A caller that has to *act* on a refusal needs the particulars -- which
+   * host an entry moved to, say -- and re-deriving them by parsing the prose
+   * message is how a client ends up showing "something went wrong".
+   */
+  constructor(status, code, message, details = null) {
     super(message);
     this.name = "RegistryError";
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -183,9 +191,45 @@ export function createStore(provider) {
       revision += 1;
       return stored;
     },
+
+    /**
+     * Decide and write under the provider's lock.
+     *
+     * `apply(existing, entries)` receives the entry, and the whole entry list,
+     * as they are at the moment of writing, and returns the entry to store.
+     * Returning `undefined` writes nothing, for a caller whose decision is
+     * "leave it alone" once it sees the entry as it really is. Anything it
+     * throws aborts the write. Use this rather than reading with
+     * `get()`/`list()` and then calling `upsert`/`setState`: between those two
+     * the registry can change, and every precondition checked that way is a
+     * race -- whether it is about one entry or about how many there are.
+     */
+    async mutate(id, apply) {
+      let wrote = false;
+      const stored = await provider.mutate(id, async (existing, entries) => {
+        const next = await apply(existing, entries);
+        if (next === undefined) return undefined;
+        wrote = true;
+        return normaliseEntry(next);
+      });
+      if (wrote) revision += 1;
+      return stored;
+    },
+    /**
+     * Remove unless `check(existing)` throws. The check runs inside the
+     * provider's lock, so a decision landing between reading the entry and
+     * deleting it -- a revoke -- is seen rather than discarded.
+     */
+    async removeIf(id, check) {
+      const removed = await provider.removeIf(id, check);
+      if (removed) revision += 1;
+      return removed;
+    },
     async remove(id) {
+      // Only a real deletion is a revision. Counting a no-op DELETE would
+      // throw away every proxy's entry cache for nothing.
       const removed = await provider.remove(id);
-      revision += 1;
+      if (removed) revision += 1;
       return removed;
     },
     async setState(id, state) {

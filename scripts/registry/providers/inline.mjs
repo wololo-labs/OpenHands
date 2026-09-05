@@ -12,6 +12,8 @@
  * the second write would drop the first entry.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import { RegistryError } from "../store.mjs";
 
 const SETTINGS_PATH = "/api/settings";
@@ -110,8 +112,24 @@ export function createInlineProvider({
   // Serialises read-modify-write cycles. `tail` never rejects, so a failed
   // mutation does not wedge the queue for the next caller.
   let tail = Promise.resolve();
+  const insideLock = new AsyncLocalStorage();
   function withLock(fn) {
-    const run = tail.then(() => fn());
+    // Refused at the call rather than once the lock is reached, because that
+    // is the only moment a nested call can be told apart from a merely
+    // concurrent one: both find the lock held, and only the nested one is
+    // running inside it. A nested call would otherwise wait on a lock its own
+    // caller holds -- forever, silently, taking every later registry write
+    // with it.
+    if (insideLock.getStore()) {
+      return Promise.reject(
+        new RegistryError(
+          500,
+          "reentrant_store_call",
+          "the registry store was re-entered from inside a mutation",
+        ),
+      );
+    }
+    const run = tail.then(() => insideLock.run(true, fn));
     tail = run.then(
       () => undefined,
       () => undefined,
@@ -122,6 +140,50 @@ export function createInlineProvider({
   return {
     list() {
       return readEntries();
+    },
+
+    /**
+     * Read-decide-write, all inside the lock.
+     *
+     * Every other mutation here re-reads under the lock but is handed a
+     * decision that was made *outside* it, against a copy of the entry that
+     * may already be stale. That is a race, not a style choice: an approval
+     * checked the host, then wrote `active` behind an in-flight registration
+     * that had moved it; a revoke landed and was then overwritten by a
+     * registration whose `state` had been computed before it.
+     *
+     * `apply(existing, entries)` runs against the entry -- and the whole entry
+     * list -- as they are at the moment of writing, so a precondition it
+     * checks cannot go stale between the check and the write. The list is
+     * passed because some preconditions are about the registry as a whole
+     * (how many entries there are, how many await approval) and those race
+     * exactly like the per-entry ones do. Throwing from `apply` writes
+     * nothing.
+     */
+    mutate(id, apply) {
+      return withLock(async () => {
+        const entries = await readEntries();
+        const index = entries.findIndex((entry) => entry.id === id);
+        const existing = index === -1 ? null : entries[index];
+
+        const next = await apply(existing, entries);
+        if (next === undefined) return existing;
+        if (next.id !== id) {
+          throw new RegistryError(
+            500,
+            "invalid_state",
+            "mutate must not change the entry id",
+          );
+        }
+
+        if (index === -1) {
+          entries.push(next);
+        } else {
+          entries[index] = next;
+        }
+        await writeEntries(entries);
+        return next;
+      });
     },
 
     upsert(entry) {
@@ -138,13 +200,36 @@ export function createInlineProvider({
       });
     },
 
+    /**
+     * Remove, with the refusal decided under the lock.
+     *
+     * `check(existing)` is handed the entry as it is at the moment of
+     * removal, not a copy read beforehand, and throws to refuse. Removing is
+     * a decision about an entry like any other: reading it, deciding, and
+     * then deleting in a second call discards anything that lands in
+     * between -- a revoke, most of all, which is the one decision that has
+     * to survive.
+     */
+    removeIf(id, check) {
+      return withLock(async () => {
+        const entries = await readEntries();
+        const existing = entries.find((entry) => entry.id === id) ?? null;
+        await check(existing);
+        const next = entries.filter((entry) => entry.id !== id);
+        if (next.length === entries.length) return false;
+        await writeEntries(next);
+        return true;
+      });
+    },
+
+    /** Returns whether an entry was actually removed. */
     remove(id) {
       return withLock(async () => {
         const entries = await readEntries();
         const next = entries.filter((entry) => entry.id !== id);
-        if (next.length !== entries.length) {
-          await writeEntries(next);
-        }
+        if (next.length === entries.length) return false;
+        await writeEntries(next);
+        return true;
       });
     },
 

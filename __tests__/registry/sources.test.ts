@@ -21,20 +21,43 @@ import { createStore, entryId } from "../../scripts/registry/store.mjs";
 
 type Entry = Record<string, any> & { id: string; state: string };
 
-function createMemoryStore(seed: Entry[] = []) {
+/**
+ * `beforeWrite` stands in for the provider's lock: it runs at the moment a
+ * write commits, which is the window a sync's decisions have to survive.
+ */
+function createMemoryStore(
+  seed: Entry[] = [],
+  beforeWrite?: () => void | Promise<void>,
+) {
   const entries = new Map(seed.map((entry) => [entry.id, entry]));
   return createStore({
     async list() {
       return [...entries.values()];
     },
     async upsert(entry: Entry) {
+      await beforeWrite?.();
       entries.set(entry.id, entry);
       return entry;
+    },
+    async mutate(
+      id: string,
+      apply: (
+        existing: Entry | null,
+        entries: Entry[],
+      ) => Promise<Entry | undefined> | Entry | undefined,
+    ) {
+      await beforeWrite?.();
+      const existing = entries.get(id) ?? null;
+      const next = await apply(existing, [...entries.values()]);
+      if (next === undefined) return existing;
+      entries.set(id, next);
+      return next;
     },
     async remove(id: string) {
       entries.delete(id);
     },
     async setState(id: string, state: string) {
+      await beforeWrite?.();
       const entry = entries.get(id);
       if (!entry) throw new Error(`no entry ${id}`);
       const updated = { ...entry, state };
@@ -152,6 +175,46 @@ describe("syncSourceEntries", () => {
     await store.setState(entryId("k8s:agents/a"), "revoked");
 
     await syncSourceEntries({ store, source: "k8s", entries: [candidate] });
+
+    expect((await store.list())[0].state).toBe("revoked");
+  });
+
+  it("does not undo a revoke that lands while it is syncing", async () => {
+    // The directory listing is read once and then written back entry by
+    // entry. A revoke arriving in that window used to be overwritten by a
+    // state computed before it, so revoking a machine the cluster still
+    // reports did not stick.
+    let revoke: (() => Promise<void>) | null = null;
+    const store = createMemoryStore([], async () => {
+      const pending = revoke;
+      revoke = null;
+      await pending?.();
+    });
+    await syncSourceEntries({ store, source: "k8s", entries: [candidate] });
+
+    const id = entryId("k8s:agents/a");
+    revoke = async () => {
+      await store.setState(id, "revoked");
+    };
+    await syncSourceEntries({ store, source: "k8s", entries: [candidate] });
+
+    expect((await store.list())[0].state).toBe("revoked");
+  });
+
+  it("does not stale a revoke that lands while it is syncing", async () => {
+    let revoke: (() => Promise<void>) | null = null;
+    const store = createMemoryStore([], async () => {
+      const pending = revoke;
+      revoke = null;
+      await pending?.();
+    });
+    await syncSourceEntries({ store, source: "k8s", entries: [candidate] });
+
+    const id = entryId("k8s:agents/a");
+    revoke = async () => {
+      await store.setState(id, "revoked");
+    };
+    await syncSourceEntries({ store, source: "k8s", entries: [] });
 
     expect((await store.list())[0].state).toBe("revoked");
   });

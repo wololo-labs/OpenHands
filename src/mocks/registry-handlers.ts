@@ -43,12 +43,38 @@ export const REGISTRY_HANDLERS = [
     return HttpResponse.json({ entries: mockEntries });
   }),
 
-  http.post("*/api/registry/:id/:action", ({ params }) => {
+  http.post("*/api/registry/:id/:action", async ({ params, request }) => {
     if (!mockEntries) return new HttpResponse(null, { status: 404 });
     const entry = findEntry(String(params.id));
     if (!entry) {
       return HttpResponse.json({ error: "not_found" }, { status: 404 });
     }
+
+    // Mirrors the real route: an approval names the address it approves, and
+    // is refused if the entry has moved since. A mock that accepts anything
+    // lets the client half of that contract rot untested.
+    if (params.action === "approve") {
+      const body = (await request.json().catch(() => null)) as {
+        host?: string;
+      } | null;
+      if (!body?.host) {
+        return HttpResponse.json({ error: "host_required" }, { status: 400 });
+      }
+      // Compared the way the route compares it, after normalising, so the
+      // mock does not 409 on a trailing slash the real registry accepts.
+      const normalise = (value: string) => value.replace(/\/+$/, "");
+      if (normalise(body.host) !== normalise(entry.host)) {
+        return HttpResponse.json(
+          {
+            error: "entry_changed",
+            message: "moved",
+            details: { host: entry.host },
+          },
+          { status: 409 },
+        );
+      }
+    }
+
     entry.state = params.action === "approve" ? "active" : "revoked";
     return HttpResponse.json({ entry });
   }),

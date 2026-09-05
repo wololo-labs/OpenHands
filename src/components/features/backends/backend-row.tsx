@@ -107,6 +107,21 @@ export function BackendRow({
           <span className="truncate text-xs text-[var(--oh-muted)]">
             {backend.host}
           </span>
+          {/*
+            A fleet entry's `host` is this origin's proxy path, which says
+            nothing about which machine is behind it. Approving one is
+            approving a machine *at an address*, so the address it actually
+            answers on has to be on the row -- otherwise the operator is asked
+            to vouch for something they cannot see.
+          */}
+          {isFleetEntry && backend.registryHost ? (
+            <span
+              data-testid={`manage-backends-registry-host-${backend.name}`}
+              className="truncate text-xs text-[var(--oh-muted)]"
+            >
+              {backend.registryHost}
+            </span>
+          ) : null}
           <span
             data-testid={`manage-backends-provenance-${backend.name}`}
             className="truncate text-xs text-[var(--oh-text-tertiary)]"

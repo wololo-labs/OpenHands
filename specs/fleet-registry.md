@@ -13,6 +13,18 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
       session key is configured. Without it, the path shall route exactly as it
       does today.
 
+### FR-001a: The registry is bounded
+
+- [x] The number of entries, not only the number awaiting approval, shall be
+      capped. Revoking a flood's leavings frees the pending gauge but leaves
+      every entry in `misc_settings`, read in full on every registration.
+
+- [x] `DELETE /api/registry/:id` shall forget an entry outright, so junk can
+      be removed rather than only revoked. It shall refuse a `revoked` entry,
+      and shall decide that inside the store's lock: reading the entry and
+      deleting it in a second call discards a revoke that lands between the
+      two, and the machine then re-enrols clean.
+
 ### FR-002: Entries persist without a new datastore
 
 - [x] Registry entries shall be written through to the agent server's
@@ -30,6 +42,26 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
       300-second window, or when its nonce has already been used inside that
       window.
 
+- [x] The nonce table shall be bounded per fingerprint rather than globally,
+      and a machine that exhausts its own budget shall be told so with `429`.
+      A global bound is a weapon: an entry that already exists skips the
+      pending cap, so one enrolled keypair could spend nonces until the shared
+      table was full and every other machine's enrolment was refused.
+
+- [x] A nonce shall be recorded inside the store's lock, atomically with the
+      write it protects, and last: no refused registration shall hold a slot,
+      and neither shall one still queued. Recorded outside the lock, a batch
+      arriving together all pass the check and all write, so the budget binds
+      only sequential traffic and one nonce buys as many writes as there are
+      concurrent requests.
+      Charging a refusal reads as making a flood pay and does the reverse,
+      because the flooder spends a throwaway keypair per attempt while the
+      slots come out of a table the whole fleet shares.
+
+- [x] A registration shall be refused for its body without reading the store,
+      so an unauthenticated caller cannot turn a malformed request into a
+      settings fetch.
+
 ### FR-005: A signature is not an authorisation
 
 - [x] A pre-seeded fingerprint shall enrol as `active`. Any other fingerprint
@@ -44,6 +76,29 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
 
 - [x] A revoked entry shall stay revoked when it re-registers, and an approved
       entry shall stay approved once its fingerprint leaves the pre-seed list.
+
+- [x] A hand-approved entry that changes its host shall return to `pending`.
+      An approval is of a machine at an address, and the address was part of
+      what the operator could see; silently repointing the proxy at somewhere
+      they never agreed to is the same escalation by another route. A
+      pre-seeded fingerprint is exempt, because pre-seeding trusts an identity
+      rather than an address, and re-announcing after a reboot or a
+      reassignment is the case self-enrolment exists for.
+
+### FR-007a: An approval names what it approves
+
+- [x] `POST /api/registry/:id/approve` shall carry the host being approved and
+      shall answer `409` when the entry has since moved. The comparison shall
+      happen inside the store's lock: a check made against an entry read
+      beforehand is a race, not a guarantee, because a registration already in
+      flight lands between the two. Otherwise an operator
+      reads the queue, the entry re-registers elsewhere -- still `pending`, so
+      the row looks unchanged -- and the approval that lands ratifies a host
+      nobody reviewed.
+
+- [x] The address a fleet entry answers on shall be shown in Manage Backends.
+      A fleet entry's `host` is this origin's proxy path, so without it the
+      operator is asked to vouch for a machine they cannot see.
 
 ### FR-008: Reads and approvals require the session key
 
@@ -181,28 +236,22 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
 
 ## Deferred
 
-Raised in the pre-merge review, deliberately not fixed here. Both are
-properties of the design rather than defects introduced by phase 1, and both
-are bounded. Recorded so they are not rediscovered from scratch.
+Raised in review, deliberately not fixed here. Recorded so it is not
+rediscovered from scratch.
 
-### An approved entry may still change its host
+### Registration is unmetered while the store rejects writes
 
-`normaliseHost` accepts any `http:`/`https:` URL, and a re-registration may
-change `host` on an entry that is already `active`. An operator approves a
-machine having seen one address; that machine can later point its entry
-somewhere else, a cloud metadata endpoint included.
+A reservation that was taken and then lost its write is handed back, so a node
+is not locked out of re-enrolling by an outage it did not cause. The cost is
+that while the agent server accepts reads and rejects writes, every attempt
+reserves, fails and refunds: 500 attempts from one keypair against a budget of
+32 all reach the store, because the budget never engages.
 
-Keeping `host` updatable is the point of self-enrolment -- re-announcing after
-a reboot, an address change or a restore is the case it exists for -- and
-exploitation needs both an approved attacker-controlled entry and a
-master-key holder to then drive traffic through it. A host allowlist, or
-demoting to `pending` when an approved entry's host changes, would close it.
-
-### A registration flood can exhaust the nonce table
-
-`consumeNonce` records a nonce before the pending-entry cap is checked, so
-self-signed registrations can fill the table (10k entries, 300s window) and
-return `503 nonce_table_full` to legitimate enrolment until it drains. It is
-memory-bounded and self-healing, and the route is unauthenticated by design.
-Checking the cap first would shrink the surface.
-
+No control is bypassed -- nothing is displaced, repointed or read, and no
+entry changes, because no write succeeds. It is load on a backend already
+failing. The obvious answer, failing fast after N consecutive write failures,
+has a worse failure mode than the problem: a breaker that trips on a blip
+refuses enrolment to real nodes while the store is healthy, which is the
+lockout the refund exists to prevent. If it is built, it belongs in the
+provider rather than in enrolment, so approve, revoke, `DELETE` and the source
+sync are covered too.

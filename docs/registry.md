@@ -69,18 +69,59 @@ decision:
 | Fingerprint not pre-seeded                       | `pending`, listed but not connectable until approved |
 | Entry revoked, then the node re-registers        | Stays `revoked`; re-registering never restores trust |
 | Entry approved, then un-seeded                   | Stays `active`; the approval already happened        |
+| Hand-approved entry re-registers on a new host   | Back to `pending`; the address was part of the approval |
+| Entry deleted with `DELETE /api/registry/:id`    | Forgotten entirely; revoke keeps it, delete does not  |
+| Pre-seeded entry re-registers on a new host      | Stays `active`; the fingerprint is what was trusted   |
 | A source stops reporting a discovered machine    | `stale`, not deleted, so a revocation is never lost  |
 
 Reads and approvals need the session key. Registration is the one route that
 does not, because a freshly provisioned node holds its own host key and none of
 the master's credentials.
 
+An approval also names the host it is approving, and is refused with `409` if
+the entry has moved since. The comparison happens inside the store's lock, so
+a registration already in flight cannot slip between the check and the write --
+the same reason a re-registration can no longer overwrite a revoke that has
+just landed. Without that, an operator reads the queue, the entry
+re-registers somewhere else -- still `pending`, so the row looks unchanged --
+and the click ratifies a host nobody reviewed. Manage Backends shows the
+address a fleet entry actually answers on for the same reason: its `host` is
+this origin's proxy path, which says nothing about the machine behind it.
+
+```bash
+curl -X POST "$MASTER/api/registry/$ID/approve" \
+  -H "X-Session-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"host":"https://node.example.ts.net:8443"}'
+```
+
 Replay is bounded: a registration's timestamp must be within 300 seconds
 (epoch **seconds**, not milliseconds) and its nonce must not have been used
 inside that window. The nonce is only recorded after the signature verifies, so
-an unauthenticated caller cannot grow the nonce table. The nonce set is
-process-local, so an ingress restart forgets it and a captured registration is
-replayable for the remainder of its window.
+an unauthenticated caller cannot grow the nonce table.
+
+The table is bounded per fingerprint, not globally, and that distinction is
+the whole of it. An entry that already exists skips the pending cap, so with a
+shared bound one enrolled keypair could re-register with fresh nonces until
+the table was full and every other machine's enrolment answered "too many in
+flight". Per identity, a flood spends the flooder's own budget and earns a
+`429` that names them. The slot is taken inside the store's lock, atomically
+with the decision it protects, and last: no refusal holds one, and neither
+does a registration that is merely queued. Checking before the lock and
+recording after it looks equivalent and is not -- a batch arriving together
+all found the table empty, all queued, and all wrote, so one keypair with one
+nonce bought a settings write per request. The check outside the lock stays,
+as a filter that keeps sequential replays from queueing at all, never as the
+guarantee. Charging a refusal would read as making a
+flood pay and do the reverse: the flooder spends a throwaway keypair per
+attempt, while the slots come out of a table the whole fleet shares.
+
+Nothing before that decision touches the store either. The body is validated
+into its stored shape against itself, so a signed but malformed registration
+costs a `JSON.parse` rather than a settings fetch, and the single read the
+call makes is the one inside the lock that writes.
+
+The nonce set is process-local, so an ingress restart forgets it and a
+captured registration is replayable for the remainder of its window.
 
 A registration proves which machine is calling and nothing else, so it does not
 get to say which secret the entry resolves. The credential reference is
@@ -98,8 +139,16 @@ of attack -- there is no reference a node can name but does not own.
 
 `host` stays updatable, which is safe *because* the reference is derived:
 repointing an entry yields only the credential of the machine whose host key
-signed the registration. Re-announcing after a reboot or an address change is
-the case this design exists for.
+signed the registration.
+
+Moving is not free, though. An entry approved by hand goes back to `pending`
+when its host changes, because an approval is of a machine *at an address* and
+that address was part of what the operator saw. Otherwise an approved entry
+could quietly repoint the master at somewhere nobody agreed to -- a link-local
+metadata address, say -- and wait for the next person to select it. A
+pre-seeded fingerprint moves freely: pre-seeding trusts the identity, not the
+address, and re-announcing after a reboot or a reassignment is exactly the case
+self-enrolment exists for.
 
 `agent-canvas enrol` derives the same reference, so it publishes the session
 key where the registry will look for it and prints the location. There is no

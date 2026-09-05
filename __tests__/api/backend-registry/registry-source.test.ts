@@ -288,14 +288,58 @@ describe("approveRegistryEntry", () => {
     await approveRegistryEntry(pending);
 
     expect(spy.mock.calls[0][0]).toBe("/api/registry/abc123/approve");
+    // The body is the fix: an approval names the address it approves, so an
+    // entry that moved between the operator reading it and clicking is
+    // refused rather than ratified. Asserting only the URL let the whole
+    // thing be deleted with the suite still green.
+    expect(JSON.parse(String(spy.mock.calls[0][1]?.body))).toEqual({
+      host: pending.registryHost,
+    });
     expect(getRegisteredBackends()[0].registryState).toBe("active");
+  });
+
+  it("does not send an approval for an entry with no known address", async () => {
+    const [pending] = mergeRegistryEntries([], [entry({ state: "pending" })]);
+    const spy = stubFetch(() => jsonResponse({ entry: {} }));
+
+    await expect(
+      approveRegistryEntry({ ...pending, registryHost: undefined }),
+    ).rejects.toMatchObject({ code: "host_unknown" });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("reports a moved entry as such, with the address it moved to", async () => {
+    const [pending] = mergeRegistryEntries([], [entry({ state: "pending" })]);
+    setRegisteredBackends([pending]);
+    stubFetch((url, init) => {
+      if (init?.method === "POST") {
+        return jsonResponse(
+          {
+            error: "entry_changed",
+            message: "moved",
+            details: { host: "https://attacker.example" },
+          },
+          409,
+        );
+      }
+      return jsonResponse({ entries: [entry({ state: "pending" })] });
+    });
+
+    // Not a transient failure: telling the operator to retry would walk them
+    // into approving the new address on the second click.
+    await expect(approveRegistryEntry(pending)).rejects.toMatchObject({
+      code: "entry_changed",
+      host: "https://attacker.example",
+    });
   });
 
   it("surfaces a rejected approval instead of pretending it worked", async () => {
     const [pending] = mergeRegistryEntries([], [entry({ state: "pending" })]);
     stubFetch(() => new Response("", { status: 401 }));
 
-    await expect(approveRegistryEntry(pending)).rejects.toThrow(/401/);
+    await expect(approveRegistryEntry(pending)).rejects.toMatchObject({
+      code: "http_401",
+    });
   });
 });
 

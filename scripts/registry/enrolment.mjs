@@ -25,7 +25,13 @@ import {
   verify as verifyEd25519,
 } from "node:crypto";
 
-import { credRefFor, entryId, RegistryError } from "./store.mjs";
+import {
+  credRefFor,
+  entryId,
+  normaliseEntry,
+  normaliseHost,
+  RegistryError,
+} from "./store.mjs";
 
 /** Fields covered by the signature, in canonical (alphabetical) order. */
 export const SIGNED_FIELDS = Object.freeze([
@@ -48,7 +54,41 @@ export const DEFAULT_REPLAY_WINDOW_SECONDS = 300;
  * far past what anyone would work through is already past useful.
  */
 export const DEFAULT_MAX_PENDING_ENTRIES = 100;
-const MAX_TRACKED_NONCES = 10_000;
+/**
+ * Ceiling on entries of any state.
+ *
+ * The pending cap alone bounds the queue, not the store: revoking the junk --
+ * the natural response to a flood -- frees the gauge and lets it refill, and
+ * every revoked entry stays in `misc_settings` forever, read in full on every
+ * registration and every proxied request. Bounding the total is what stops a
+ * flood leaving a permanently fat settings document behind. Well past any
+ * real fleet; an operator who reaches it has junk to delete.
+ */
+export const DEFAULT_MAX_ENTRIES = 500;
+/**
+ * Nonces one fingerprint may spend inside a replay window.
+ *
+ * The table has to be bounded, and bounding it *globally* is what made it a
+ * weapon: an entry that already exists skips the pending cap, so a single
+ * enrolled keypair could re-register with fresh nonces until the table was
+ * full and every other machine's enrolment answered "too many in flight".
+ * Bounded per identity, a flood costs the flooder its own budget and nobody
+ * else's. Well above what any real node needs -- one registration per boot,
+ * plus retries.
+ */
+export const DEFAULT_MAX_NONCES_PER_FINGERPRINT = 32;
+/**
+ * Backstop on total tracked nonces.
+ *
+ * One identity cannot reach it, because of the per-fingerprint bound. Many
+ * cannot either, because a slot is only *held* by a registration that was
+ * written: everything else hands it straight back, so a flood spending a
+ * fresh fingerprint per attempt leaves nothing behind. What can be held at
+ * once is therefore bounded by the entry cap times the per-fingerprint bound,
+ * plus whatever is genuinely in flight -- and requests in flight are bounded
+ * by the connections serving them, not by this table.
+ */
+const MAX_TRACKED_NONCES = 100_000;
 const SSH_ED25519 = "ssh-ed25519";
 const ED25519_RAW_KEY_BYTES = 32;
 const ED25519_SIGNATURE_BYTES = 64;
@@ -159,12 +199,42 @@ export function normaliseFingerprint(value) {
  *     so dropping a decommissioned host from the allowlist is final;
  *   - an already-approved entry keeps its state even once its fingerprint
  *     leaves the pre-seed list;
- *   - a pending entry is promoted only by a pre-seeded fingerprint.
+ *   - a pending entry is promoted only by a pre-seeded fingerprint;
+ *   - a hand-approved entry that changes address returns to `pending`, so
+ *     the operator decides again about the machine as it now is.
+ *
+ * A `stale` entry is only ever produced by a pull source, and a pull source
+ * writes through `sources/sync.mjs` rather than here, so the `stale` branch
+ * of this function is unreachable from enrolment today.
+ *
+ * @param {object|null} existing        the stored entry, or null on a first
+ *                                      registration
+ * @param {boolean}     preSeeded       whether the fingerprint is allowlisted
+ * @param {string}      requestedHost   normalised host being registered
  */
-export function nextState(existing, preSeeded) {
+export function nextState(existing, preSeeded, requestedHost) {
   if (!existing) return preSeeded ? "active" : "pending";
+  // Required rather than defaulted: a missing host used to mean "no move",
+  // so a caller that forgot the argument silently lost the check.
+  if (typeof requestedHost !== "string" || requestedHost === "") {
+    throw new RegistryError(
+      500,
+      "invalid_state",
+      "nextState requires the host being registered",
+    );
+  }
   if (existing.state === "revoked") return "revoked";
   if (existing.state === "pending") return preSeeded ? "active" : "pending";
+  // An approval is of a machine *at an address*. A pre-seeded fingerprint is
+  // trusted as an identity, so it may move freely -- that is what pre-seeding
+  // means, and re-announcing after a reboot or an address change is the case
+  // self-enrolment exists for. An entry approved by hand was approved on what
+  // the operator could see, and the host was part of it, so moving one sends
+  // it back to the queue they already have rather than silently repointing
+  // the proxy at somewhere they never agreed to.
+  if (!preSeeded && requestedHost && requestedHost !== existing.host) {
+    return "pending";
+  }
   return existing.state;
 }
 
@@ -205,12 +275,15 @@ function requireBodyString(body, field) {
 /**
  * @param {{
  *   store: {
- *     get(id: string): Promise<any>,
- *     upsert(entry: any): Promise<any>,
+ *     list(): Promise<any[]>,
+ *     mutate(id: string, apply: (existing: any) => any): Promise<any>,
  *   },
  *   allowlist?: string[],
  *   now?: () => number,
  *   replayWindowSeconds?: number,
+ *   maxPendingEntries?: number,
+ *   maxNoncesPerFingerprint?: number,
+ *   maxEntries?: number,
  * }} options
  */
 export function createEnrolment({
@@ -219,12 +292,21 @@ export function createEnrolment({
   now = () => Date.now(),
   replayWindowSeconds = DEFAULT_REPLAY_WINDOW_SECONDS,
   maxPendingEntries = DEFAULT_MAX_PENDING_ENTRIES,
+  maxNoncesPerFingerprint = DEFAULT_MAX_NONCES_PER_FINGERPRINT,
+  maxEntries = DEFAULT_MAX_ENTRIES,
 }) {
   const preSeeded = new Set(
     allowlist.map(normaliseFingerprint).filter((value) => value !== null),
   );
-  /** nonce -> epoch ms it was accepted, pruned on every call. */
+  /**
+   * `"<fingerprint>:<nonce>"` -> epoch ms it was accepted, pruned on every
+   * call. Keyed by fingerprint as well as nonce so one machine's traffic can
+   * never evict another's, and so two nodes picking the same nonce are not
+   * mistaken for a replay.
+   */
   const seenNonces = new Map();
+  /** fingerprint -> how many of its nonces are currently tracked. */
+  const nonceCounts = new Map();
 
   function assertFresh(ts, nowMs) {
     if (typeof ts !== "number" || !Number.isFinite(ts)) {
@@ -240,18 +322,53 @@ export function createEnrolment({
     }
   }
 
-  function consumeNonce(nonce, nowMs) {
+  function pruneNonces(nowMs) {
     const windowMs = replayWindowSeconds * 1000;
-    for (const [seen, at] of seenNonces) {
-      if (nowMs - at > windowMs) seenNonces.delete(seen);
+    for (const [key, entry] of seenNonces) {
+      if (nowMs - entry.at <= windowMs) continue;
+      seenNonces.delete(key);
+      const remaining = (nonceCounts.get(entry.fingerprint) ?? 1) - 1;
+      if (remaining > 0) {
+        nonceCounts.set(entry.fingerprint, remaining);
+      } else {
+        nonceCounts.delete(entry.fingerprint);
+      }
     }
-    if (seenNonces.has(nonce)) {
+  }
+
+  /**
+   * Replay and budget checks, without spending anything.
+   *
+   * Split from the spend so it can run *before* the store is read. A refusal
+   * that happens after the read still costs one full settings fetch from the
+   * agent server per attempt, which is the amplification a flood actually
+   * wants; checking first means a machine over its budget is turned away for
+   * the price of a Map lookup.
+   */
+  function checkNonce(fingerprint, nonce, nowMs) {
+    pruneNonces(nowMs);
+
+    const key = `${fingerprint}:${nonce}`;
+    if (seenNonces.has(key)) {
       throw new RegistryError(
         401,
         "replayed_nonce",
         "nonce has already been used",
       );
     }
+
+    const spent = nonceCounts.get(fingerprint) ?? 0;
+    if (spent >= maxNoncesPerFingerprint) {
+      // This machine's own budget, so the refusal lands on the flooder rather
+      // than on whoever tries to enrol next.
+      throw new RegistryError(
+        429,
+        "too_many_registrations",
+        `this key has registered ${spent} times in the last ` +
+          `${replayWindowSeconds}s; slow down`,
+      );
+    }
+
     if (seenNonces.size >= MAX_TRACKED_NONCES) {
       throw new RegistryError(
         503,
@@ -259,7 +376,30 @@ export function createEnrolment({
         "too many registrations in flight, retry shortly",
       );
     }
-    seenNonces.set(nonce, nowMs);
+    return key;
+  }
+
+  /**
+   * Records a nonce as spent. Deliberately does not re-check: it runs after
+   * the write, and a duplicate arriving in parallel must not turn an entry
+   * that was stored into an error.
+   */
+  /** Hands a slot back when the write it was taken for never happened. */
+  function releaseNonce(fingerprint, nonce) {
+    if (!seenNonces.delete(`${fingerprint}:${nonce}`)) return;
+    const remaining = (nonceCounts.get(fingerprint) ?? 1) - 1;
+    if (remaining > 0) {
+      nonceCounts.set(fingerprint, remaining);
+    } else {
+      nonceCounts.delete(fingerprint);
+    }
+  }
+
+  function spendNonce(fingerprint, nonce, nowMs) {
+    const key = `${fingerprint}:${nonce}`;
+    if (seenNonces.has(key)) return;
+    seenNonces.set(key, { at: nowMs, fingerprint });
+    nonceCounts.set(fingerprint, (nonceCounts.get(fingerprint) ?? 0) + 1);
   }
 
   return {
@@ -290,43 +430,135 @@ export function createEnrolment({
           "signature does not verify against pubkey",
         );
       }
-      consumeNonce(nonce, nowMs);
 
       const fingerprint = fingerprintFromPublicKey(body.pubkey);
+      const isPreSeeded = preSeeded.has(fingerprint);
       const id = entryId(fingerprint);
-      const entries = await store.list();
-      const existing = entries.find((entry) => entry.id === id) ?? null;
 
-      // Only a *new* entry that would land pending is capped. A machine that is
-      // already listed, and one whose fingerprint is pre-seeded, always gets
-      // through, so a flood cannot lock out the fleet it is trying to drown.
-      if (!existing && !preSeeded.has(fingerprint)) {
-        const pending = entries.filter(
-          (entry) => entry.state === "pending",
-        ).length;
-        if (pending >= maxPendingEntries) {
-          throw new RegistryError(
-            429,
-            "too_many_pending",
-            `${pending} registrations are already awaiting approval; ` +
-              "approve or revoke some before enrolling another machine",
-          );
-        }
-      }
+      // A cheap pre-filter, not the guarantee: a caller that is already over
+      // its budget, or replaying something already recorded, is turned away
+      // for a Map lookup rather than a settings fetch. The check that counts
+      // runs under the lock, where nothing can interleave between it and the
+      // write it is protecting.
+      checkNonce(fingerprint, nonce, nowMs);
+      // Normalised here rather than left to the store, because the state
+      // machine below compares it against what is already stored and a
+      // trailing slash is not an address change.
+      const host = normaliseHost(body.host);
 
-      const entry = await store.upsert({
+      // Shaped and validated before the store is read at all. Every way this
+      // call can be refused for its *body* -- an over-long name, a version
+      // string past its limit, anything `normaliseEntry` rejects -- is
+      // settled against the body alone, so a malformed registration costs a
+      // `JSON.parse` and not a settings fetch. `state` and `credRef` here are
+      // placeholders of the right shape: the real ones are decided under the
+      // lock below, against the entry as it is then.
+      normaliseEntry({
         id,
         name: body.name,
-        host: body.host,
+        host,
         pubkey: body.pubkey,
         fingerprint,
-        credRef: resolveCredRef(existing, fingerprint, body.credRef),
+        credRef: credRefFor(fingerprint),
         version: body.version,
-        state: nextState(existing, preSeeded.has(fingerprint)),
+        state: "pending",
         lastSeen: new Date(nowMs).toISOString(),
       });
 
-      return { entry, created: existing === null };
+      let created = false;
+      let spent = false;
+      // The trust decision is made against the entry as it is at the moment
+      // of writing, rather than against a copy read beforehand. Deciding
+      // outside the lock let a registration already in flight overwrite an
+      // operator's revoke with a `state` computed before it: revocation did
+      // not stick against a machine that was still re-registering, which is
+      // the one machine it has to stick against.
+      const write = store.mutate(id, (current, entries) => {
+        created = current === null;
+
+        // The reservation has to be taken here, atomically with the decision
+        // it protects. Checked before the lock and recorded after it, a batch
+        // arriving together all found the table empty, all queued, and all
+        // wrote: an existing entry skips the caps, so one keypair with one
+        // nonce bought a thousand settings writes and the per-fingerprint
+        // budget was enforceable only against traffic that arrived one at a
+        // time.
+        checkNonce(fingerprint, nonce, nowMs);
+
+        // Capped here rather than before the write, for the same reason the
+        // trust decision is: a count read beforehand is a count a burst
+        // arriving in parallel has already invalidated. Checked outside the
+        // lock, forty concurrent registrations put eighteen entries past a
+        // cap of three.
+        //
+        // Only a *new* entry is capped. A machine already listed, and one
+        // whose fingerprint is pre-seeded, always gets through, so a flood
+        // cannot lock out the fleet it is trying to drown.
+        if (created && !isPreSeeded) {
+          if (entries.length >= maxEntries) {
+            throw new RegistryError(
+              429,
+              "too_many_entries",
+              `the registry holds ${entries.length} entries; ` +
+                "remove some before enrolling another machine",
+            );
+          }
+          const pending = entries.filter(
+            (entry) => entry.state === "pending",
+          ).length;
+          if (pending >= maxPendingEntries) {
+            throw new RegistryError(
+              429,
+              "too_many_pending",
+              `${pending} registrations are already awaiting approval; ` +
+                "approve or revoke some before enrolling another machine",
+            );
+          }
+        }
+
+        // Last, so that nothing a refusal reaches has spent anything: the
+        // slot comes out of a table the whole fleet shares, and a flood
+        // spends a throwaway keypair per attempt, so charging it for being
+        // refused costs the flooder nothing and denies enrolment to everyone
+        // else.
+        spendNonce(fingerprint, nonce, nowMs);
+        spent = true;
+
+        return {
+          id,
+          name: body.name,
+          host,
+          pubkey: body.pubkey,
+          fingerprint,
+          credRef: resolveCredRef(current, fingerprint, body.credRef),
+          version: body.version,
+          state: nextState(current, isPreSeeded, host),
+          lastSeen: new Date(nowMs).toISOString(),
+        };
+      });
+
+      let entry;
+      try {
+        entry = await write;
+      } catch (error) {
+        // The reservation was taken and the write then failed, so it was
+        // never really used. Keeping it would let an agent-server outage burn
+        // a node's budget and lock it out of re-enrolling for the rest of the
+        // window, exactly when re-enrolling matters.
+        //
+        // Narrowed to the one code that means "the write did not happen". A
+        // release is a hole whenever the write *did* happen, and this branch
+        // is the natural place for a future edit to widen without noticing
+        // that. Anything else that throws here has not reserved: the nonce
+        // check and the caps run before the reservation, and a failed read
+        // means the callback never ran at all.
+        if (spent && error?.code === "store_unavailable") {
+          releaseNonce(fingerprint, nonce);
+        }
+        throw error;
+      }
+
+      return { entry, created };
     },
   };
 }

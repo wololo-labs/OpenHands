@@ -68,7 +68,6 @@ export async function syncSourceEntries({
   now = () => Date.now(),
 }) {
   const existing = await store.list();
-  const byId = new Map(existing.map((entry) => [entry.id, entry]));
   const seen = new Set();
   const lastSeen = new Date(now()).toISOString();
 
@@ -76,26 +75,37 @@ export async function syncSourceEntries({
   for (const entry of entries) {
     const id = entryId(entry.fingerprint);
     seen.add(id);
+    // `current`, not the copy read before the loop: a revoke landing while a
+    // sync is in flight would otherwise be overwritten by a state computed
+    // before it, and a directory listing would undo an operator's decision.
     synced.push(
-      await store.upsert({
+      await store.mutate(id, (current) => ({
         ...entry,
         id,
         source,
-        state: nextState(byId.get(id), entry.reachable !== false),
+        state: nextState(current, entry.reachable !== false),
         lastSeen,
-      }),
+      })),
     );
   }
 
   for (const entry of existing) {
-    if (
-      entry.source === source &&
-      !seen.has(entry.id) &&
-      entry.state !== "stale" &&
-      entry.state !== "revoked"
-    ) {
-      await store.setState(entry.id, "stale");
-    }
+    // Filtered against the snapshot first, so an idle poll over a settled
+    // fleet does no writes at all: every entry here is already `stale` or
+    // `revoked` and there is nothing to say. The check is repeated under the
+    // lock below because this copy can be out of date; it is only ever
+    // skipping work, never deciding.
+    if (entry.source !== source || seen.has(entry.id)) continue;
+    if (entry.state === "stale" || entry.state === "revoked") continue;
+    // Re-checked under the lock for the same reason: the entry may have been
+    // revoked since the listing above was read.
+    await store.mutate(entry.id, (current) => {
+      if (!current || current.source !== source) return undefined;
+      if (current.state === "stale" || current.state === "revoked") {
+        return undefined;
+      }
+      return { ...current, state: "stale" };
+    });
   }
 
   return synced;

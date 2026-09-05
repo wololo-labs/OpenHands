@@ -24,6 +24,13 @@ export interface Backend {
   provenance?: BackendProvenance;
   /** Registry trust state; only meaningful when `provenance` is `"registry"`. */
   registryState?: RegistryEntryState;
+  /**
+   * The address the fleet entry actually answers on, as opposed to `host`,
+   * which is this origin's proxy path. Kept because an operator approving an
+   * entry is approving a machine *at an address*, and the proxy path shows
+   * them nothing about which machine that is.
+   */
+  registryHost?: string;
 }
 
 export interface BackendSelection {
