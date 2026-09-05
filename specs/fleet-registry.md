@@ -231,3 +231,27 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
 
 - [x] Enabling Kubernetes discovery shall create a namespace-scoped Role for
       listing Services, independent of the chart's broad `admin` binding.
+
+---
+
+## Deferred
+
+Raised in review, deliberately not fixed here. Recorded so it is not
+rediscovered from scratch.
+
+### Registration is unmetered while the store rejects writes
+
+A reservation that was taken and then lost its write is handed back, so a node
+is not locked out of re-enrolling by an outage it did not cause. The cost is
+that while the agent server accepts reads and rejects writes, every attempt
+reserves, fails and refunds: 500 attempts from one keypair against a budget of
+32 all reach the store, because the budget never engages.
+
+No control is bypassed -- nothing is displaced, repointed or read, and no
+entry changes, because no write succeeds. It is load on a backend already
+failing. The obvious answer, failing fast after N consecutive write failures,
+has a worse failure mode than the problem: a breaker that trips on a blip
+refuses enrolment to real nodes while the store is healthy, which is the
+lockout the refund exists to prevent. If it is built, it belongs in the
+provider rather than in enrolment, so approve, revoke, `DELETE` and the source
+sync are covered too.
