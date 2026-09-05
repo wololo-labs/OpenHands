@@ -6,6 +6,7 @@ import { getLockedCloudHost } from "#/api/agent-server-config";
 import {
   approveRegistryEntry,
   getRegistryStatus,
+  RegistryActionError,
   revokeRegistryEntry,
   subscribeRegistryStatus,
 } from "#/api/backend-registry/registry-source";
@@ -135,11 +136,25 @@ export function ManageBackendsModal({
       setRegistryError(null);
       try {
         await action();
-      } catch {
+      } catch (error) {
+        // `entry_changed` is not a transient failure. The machine moved
+        // between the operator reading the row and clicking, so saying
+        // "try again" would walk them into approving the new address on the
+        // second click -- the whole thing the refusal exists to prevent.
+        if (
+          error instanceof RegistryActionError &&
+          error.code === "entry_changed" &&
+          error.host
+        ) {
+          setRegistryError(
+            t(I18nKey.BACKEND$APPROVE_ENTRY_CHANGED, { host: error.host }),
+          );
+          return;
+        }
         setRegistryError(failureMessage);
       }
     },
-    [],
+    [t],
   );
 
   const handleApprove = React.useCallback(

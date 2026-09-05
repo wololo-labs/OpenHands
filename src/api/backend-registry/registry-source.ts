@@ -246,6 +246,26 @@ export async function hydrateFromRegistry(): Promise<boolean> {
   }
 }
 
+/**
+ * A registry refusal, carrying the machine-readable code and whatever
+ * particulars came with it.
+ *
+ * The code matters to the caller: `entry_changed` is not a transient failure
+ * to retry, it means the machine moved and the operator has to look again.
+ * Collapsing it into a generic error turns a working safeguard into something
+ * that goes away on the second click.
+ */
+export class RegistryActionError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly host?: string,
+  ) {
+    super(message);
+    this.name = "RegistryActionError";
+  }
+}
+
 async function setRegistryEntryState(
   backend: Backend,
   action: "approve" | "revoke",
@@ -255,21 +275,40 @@ async function setRegistryEntryState(
 
   // Approve names the address it is approving, so an entry that moved between
   // the operator reading the row and clicking is refused rather than ratified.
-  const body =
+  if (action === "approve" && !backend.registryHost) {
+    throw new RegistryActionError(
+      "host_unknown",
+      "this entry has no address to approve",
+    );
+  }
+
+  const init: RequestInit =
     action === "approve"
       ? {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ host: backend.registryHost ?? "" }),
+          body: JSON.stringify({ host: backend.registryHost }),
         }
       : { method: "POST" };
 
   const response = await registryRequest(
     `${REGISTRY_ENDPOINT}/${encodeURIComponent(entryId)}/${action}`,
-    body,
+    init,
   );
   if (!response.ok) {
-    throw new Error(`registry ${action} failed with ${response.status}`);
+    const failure = (await response.json().catch(() => null)) as {
+      error?: string;
+      message?: string;
+      details?: { host?: string };
+    } | null;
+    // Re-read before surfacing, so whatever the operator is shown next is the
+    // entry as it now is rather than the copy they clicked on.
+    await hydrateFromRegistry();
+    throw new RegistryActionError(
+      failure?.error ?? `http_${response.status}`,
+      failure?.message ?? `registry ${action} failed with ${response.status}`,
+      failure?.details?.host,
+    );
   }
   await hydrateFromRegistry();
 }

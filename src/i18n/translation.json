@@ -41683,6 +41683,23 @@
     "uk": "Не вдалося схвалити цей бекенд. Реєстр флоту не прийняв зміну.",
     "ca": "No s'ha pogut aprovar aquest backend. El registre de la flota no ha acceptat el canvi."
   },
+  "BACKEND$APPROVE_ENTRY_CHANGED": {
+    "en": "This machine now answers on {{host}}. Review it again before approving.",
+    "ja": "このマシンは現在 {{host}} で応答しています。承認する前に再確認してください。",
+    "zh-CN": "此机器现在通过 {{host}} 响应。请重新核对后再批准。",
+    "zh-TW": "此機器現在透過 {{host}} 回應。請重新核對後再核准。",
+    "ko-KR": "이 머신은 이제 {{host}} 에서 응답합니다. 승인하기 전에 다시 확인하세요.",
+    "no": "Denne maskinen svarer nå på {{host}}. Se over den på nytt før du godkjenner.",
+    "it": "Questa macchina ora risponde su {{host}}. Verificala di nuovo prima di approvarla.",
+    "pt": "Esta máquina agora responde em {{host}}. Revise-a novamente antes de aprovar.",
+    "es": "Esta máquina ahora responde en {{host}}. Revísala de nuevo antes de aprobarla.",
+    "ar": "تستجيب هذه الآلة الآن على {{host}}. راجعها مرة أخرى قبل الاعتماد.",
+    "fr": "Cette machine répond désormais sur {{host}}. Vérifiez-la à nouveau avant de l'approuver.",
+    "tr": "Bu makine artık {{host}} üzerinden yanıt veriyor. Onaylamadan önce yeniden gözden geçirin.",
+    "de": "Diese Maschine antwortet jetzt auf {{host}}. Prüfen Sie sie erneut, bevor Sie sie genehmigen.",
+    "uk": "Ця машина тепер відповідає на {{host}}. Перевірте її ще раз перед схваленням.",
+    "ca": "Aquesta màquina ara respon a {{host}}. Revisa-la de nou abans d'aprovar-la."
+  },
   "BACKEND$REVOKE_FAILED": {
     "en": "Could not revoke this backend. It may still be reachable — try again.",
     "ja": "このバックエンドを取り消せませんでした。まだ接続可能な可能性があります。再試行してください。",
