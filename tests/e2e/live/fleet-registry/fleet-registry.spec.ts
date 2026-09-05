@@ -610,11 +610,26 @@ test("a conversation runs on the remote node through the proxy", async ({
   const settings = await (
     await request.get(`${proxied}/api/settings`, { headers: masterAuth })
   ).json();
+  expect(
+    settings.llm_api_key_is_set,
+    "this asserts the node runs on its own configuration, so the master must " +
+      "not be the one holding the model credential",
+  ).toBeFalsy();
+
+  // Launched from the node's active agent profile, which is how the canvas
+  // starts a conversation and the only shape that reaches an ACP agent: an
+  // inline `agent_settings` dump loses the ACP fields, and the server falls
+  // back to the LLM agent, which then fails on a model it cannot resolve.
+  const profiles = await (
+    await request.get(`${proxied}/api/agent-profiles`, { headers: masterAuth })
+  ).json();
   const created = await request.post(`${proxied}/api/conversations`, {
     headers: masterAuth,
     data: {
       workspace: { kind: "LocalWorkspace", working_dir: "workspace/project" },
-      agent_settings: settings.agent_settings,
+      ...(profiles.active_agent_profile_id
+        ? { agent_profile_id: profiles.active_agent_profile_id }
+        : { agent_settings: settings.agent_settings }),
       initial_message: {
         role: "user",
         content: [{ type: "text", text: "hello from the fleet proxy" }],
@@ -652,42 +667,73 @@ test("a conversation runs on the remote node through the proxy", async ({
     kind?: string;
     code?: string;
     value?: string;
+    source?: string;
   }
+  // Terminal by name, rather than "anything that is not `running`". State
+  // updates also carry ids and objects as their value, and every one of those
+  // reads as not-running -- so the poll used to return before the agent had
+  // even started, and the run was judged on the first two events.
+  const TERMINAL = new Set(["finished", "error", "stopped", "idle"]);
   let events: ConversationEvent[] = [];
   await expect
     .poll(
       async () => {
         const response = await request.get(
-          `${proxied}/api/conversations/${conversation.id}/events/search?page_size=50`,
+          `${proxied}/api/conversations/${conversation.id}/events/search?page_size=100`,
           { headers: masterAuth, failOnStatusCode: false },
         );
-        if (!response.ok()) return "";
+        if (!response.ok()) return false;
         events = ((await response.json()).items ?? []) as ConversationEvent[];
-        const status = events
+        return events
           .filter(
             (event: ConversationEvent) =>
               event.kind === "ConversationStateUpdateEvent",
           )
-          .at(-1);
-        return status?.value ?? "";
+          .some((event: ConversationEvent) =>
+            TERMINAL.has(String(event.value ?? "")),
+          );
       },
-      { timeout: 60_000, message: "the agent never reached a terminal state" },
+      {
+        timeout: 180_000,
+        message: "the agent never reached a terminal state",
+      },
     )
-    .not.toBe("running");
+    .toBe(true);
 
+  // What proves the model actually ran is the agent *acting*, not the absence
+  // of one particular error code. Asserting the absence let an `ACPInitError`
+  // read as a completed run: the agent never started, and nothing said so.
+  const agentActed = events.some(
+    (event: ConversationEvent) =>
+      event.source === "agent" &&
+      (event.kind === "ActionEvent" || event.kind === "MessageEvent"),
+  );
   const llmAuthFailure = events.some(
     (event: ConversationEvent) => event.code === "LLMAuthenticationError",
   );
+  const errors = events
+    .filter((event: ConversationEvent) => event.code)
+    .map((event: ConversationEvent) => event.code)
+    .join(", ");
+
   expect(
     events.length,
     "the remote agent produced no events at all",
   ).toBeGreaterThan(2);
+  // A node with no usable model credential stops at `LLMAuthenticationError`,
+  // which still proves every hop up to the model call and is the documented
+  // degraded outcome. Any other way of not acting is a failure.
+  expect(
+    agentActed || llmAuthFailure,
+    `the remote agent never acted; errors: ${errors || "none"}`,
+  ).toBe(true);
   console.log(
-    llmAuthFailure
-      ? `PARTIAL: ${NODE1} has no LLM credential, so the run stopped at ` +
-          `LLMAuthenticationError. Every hop before the model call is proven: ` +
-          `${events.length} events were written on the remote host.`
-      : `${NODE1} ran the conversation to completion (${events.length} events).`,
+    agentActed
+      ? `${NODE1} ran the conversation to completion, agent acted ` +
+          `(${events.length} events).`
+      : `PARTIAL: ${NODE1} has no usable model credential, so the run stopped ` +
+          `at LLMAuthenticationError. Every hop before the model call is ` +
+          `proven: ${events.length} events were written on the remote host.`,
   );
 
   await request.delete(`${proxied}/api/conversations/${conversation.id}`, {

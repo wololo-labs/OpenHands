@@ -380,6 +380,22 @@ says so if it finds anything else. Re-run `up` before re-running the spec: the
 `pending` state cannot be restored through the API by design, since re-enrolment
 never de-escalates trust.
 
+The conversation assertion is the one that needs the remote node to be able to
+run a model at all. It launches from the node's own active agent profile, which
+is how the canvas starts a conversation and the only shape that reaches an ACP
+agent: an inline `agent_settings` dump loses the ACP fields and the server falls
+back to the LLM agent. What it asserts is that the agent *acted* -- an
+`ActionEvent` from the agent -- rather than the absence of one error code. A
+node with no usable model credential stops at `LLMAuthenticationError`, which
+still proves every hop up to the model call and is accepted as the degraded
+outcome; any other way of not acting is a failure.
+
+A node driving Claude Code over ACP needs `permissions.defaultMode` in its
+`~/.claude/settings.json` to be a mode that CLI accepts on an ACP session.
+`auto` is accepted as a `--permission-mode` flag and rejected by the ACP path,
+where it surfaces as `ACPInitError: Invalid permissions.defaultMode: auto` and
+looks nothing like a configuration problem.
+
 Point it at your own machines with `FLEET_RIG_NODE1_SSH`,
 `FLEET_RIG_NODE1_NAME`, `FLEET_RIG_NODE1_PORT` and `FLEET_RIG_MASTER_ADDRESS`.
 The spec cannot run in ordinary CI, which is why it is not in `npm test` and
