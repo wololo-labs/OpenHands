@@ -30,9 +30,16 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
       300-second window, or when its nonce has already been used inside that
       window.
 
+- [x] The nonce table shall be bounded per fingerprint rather than globally,
+      and a machine that exhausts its own budget shall be told so with `429`.
+      A global bound is a weapon: an entry that already exists skips the
+      pending cap, so one enrolled keypair could spend nonces until the shared
+      table was full and every other machine's enrolment was refused.
+
 - [x] A registration the registry refuses shall not consume a nonce slot. The
-      table is finite, so spending one on a rejected call lets a flood fill it
-      and answer `503` to the enrolments that would have been accepted.
+      entry is validated into its stored shape before the nonce is spent, so
+      every rejection reachable from a malformed body costs the caller
+      nothing.
 
 ### FR-005: A signature is not an authorisation
 
@@ -56,6 +63,18 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
       pre-seeded fingerprint is exempt, because pre-seeding trusts an identity
       rather than an address, and re-announcing after a reboot or a
       reassignment is the case self-enrolment exists for.
+
+### FR-007a: An approval names what it approves
+
+- [x] `POST /api/registry/:id/approve` shall carry the host being approved and
+      shall answer `409` when the entry has since moved. Otherwise an operator
+      reads the queue, the entry re-registers elsewhere -- still `pending`, so
+      the row looks unchanged -- and the approval that lands ratifies a host
+      nobody reviewed.
+
+- [x] The address a fleet entry answers on shall be shown in Manage Backends.
+      A fleet entry's `host` is this origin's proxy path, so without it the
+      operator is asked to vouch for a machine they cannot see.
 
 ### FR-008: Reads and approvals require the session key
 
