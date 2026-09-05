@@ -45,6 +45,7 @@ import {
   createRouter,
   isBenignSocketError,
   isServerInfoRequest,
+  logSafeUrl,
   matchesPathPrefix,
   proxyServerInfoRequest,
 } from "./proxy-utils.mjs";
@@ -365,7 +366,7 @@ export function startIngress(config) {
     // has no session key, so this route cannot live behind the agent server.
     if (registry && isRegistryRequest(req)) {
       registry.handle(req, res).catch((err) => {
-        console.error(`Registry error for ${url}:`, err);
+        console.error(`Registry error for ${logSafeUrl(url)}:`, err);
         res.destroy();
       });
       return;
@@ -373,7 +374,7 @@ export function startIngress(config) {
 
     if (backendProxy && isBackendProxyRequest(req)) {
       backendProxy.handle(req, res).catch((err) => {
-        console.error(`Backend proxy error for ${url}:`, err);
+        console.error(`Backend proxy error for ${logSafeUrl(url)}:`, err);
         res.destroy();
       });
       return;
