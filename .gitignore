@@ -47,3 +47,6 @@ build-fresh/
 
 # Local MCP server wiring, written per checkout by the session runner
 .mcp.json
+
+# Fleet-run evidence dumps (event exports, video, proxy logs copied out of a rig)
+.agents/evidence/runtime/
