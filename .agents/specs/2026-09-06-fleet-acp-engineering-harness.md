@@ -148,7 +148,7 @@ Edge cases:
 | Tests fail on the node | node's own run is red | Node diagnoses and fixes; that loop is the point, not a failure |
 | Review finds high or medium | code-reviewer on the PR | Send back to the **node** to fix, not the master |
 | A commit has no event id | attribution chain broken | Harness FAILED, even with a green PR |
-| ACP downgrades silently | settings dump loses the launch shape | Treat as a node fault; the config-key footgun must be fixed properly, not worked around |
+| ACP fails at init | `permissions.defaultMode: "auto"` in the node's `/home/claude/.claude/settings.json` | Set `bypassPermissions`, or scope it with `acp_session_mode`. Config alone proves nothing: verify with agent-sourced `SystemPromptEvent` plus `ActionEvent`, never with `LLMBadRequestError`, which appears in successful runs too |
 | 4h cap reached | wall clock | Stop, report what is proven and what is not |
 
 ## Errors
