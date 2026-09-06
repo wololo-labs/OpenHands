@@ -44,3 +44,8 @@ build-fresh/
 /resources/bin/
 # Downloaded Node.js distribution (populated by `npm run download-node` before packaging)
 /resources/node/
+
+# Agent skill scratch: goal artefacts are per-machine, never shared history
+.agents/goals/
+# Local MCP server wiring, written per checkout by the session runner
+.mcp.json
