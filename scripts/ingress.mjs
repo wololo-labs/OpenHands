@@ -50,6 +50,7 @@ import {
   proxyServerInfoRequest,
 } from "./proxy-utils.mjs";
 import { createBackendProxy, isBackendProxyRequest } from "./proxy-backend.mjs";
+import { createAccessLog } from "./registry/access-log.mjs";
 import { createRegistry, isRegistryRequest } from "./registry/routes.mjs";
 import { createSecretProvider } from "./registry/secrets/interface.mjs";
 import {
@@ -76,6 +77,7 @@ function parseArgs() {
     registryPreseed: [],
     registrySecretProvider: null,
     registryAllowUncredentialed: false,
+    registryAccessLog: null,
     registrySources: [],
   };
 
@@ -122,6 +124,9 @@ function parseArgs() {
         break;
       case "--registry-allow-uncredentialed":
         config.registryAllowUncredentialed = true;
+        break;
+      case "--registry-access-log":
+        config.registryAccessLog = args[++i] || null;
         break;
       case "--registry-source":
         config.registrySources.push(args[++i]);
@@ -177,6 +182,10 @@ OPTIONS:
                               relayed to with no credential at all, which on
                               an agent server that does not authenticate
                               makes /backend/:id an open relay.
+  --registry-access-log <f>   Append one JSON line per /backend/:id request
+                              to <f>: the wire record of every hop to a fleet
+                              node. Off unless given. The caller's session key
+                              is stripped from the URL before writing.
   --registry-source <name>    Populate the registry from a directory that
                               already knows the fleet (k8s, tailnet).
                               Repeatable.
@@ -194,6 +203,7 @@ ENVIRONMENT VARIABLES:
   REGISTRY_SECRET_PROVIDER    Secret provider for proxied fleet credentials
   REGISTRY_ALLOW_UNCREDENTIALED
                               Proxy fleet entries that carry no credential
+  REGISTRY_ACCESS_LOG         Append one JSON line per /backend/:id request
   REGISTRY_SOURCE_KUBERNETES  Populate the registry from labelled Services
   REGISTRY_SOURCE_TAILNET     Populate the registry from tagged tailnet peers
 
@@ -282,6 +292,7 @@ function buildRegistryConfig(args, env, routes, defaultBackend) {
     allowUncredentialed:
       args.registryAllowUncredentialed ||
       Boolean(env.REGISTRY_ALLOW_UNCREDENTIALED),
+    accessLogFile: args.registryAccessLog || env.REGISTRY_ACCESS_LOG || null,
     sources: {
       kubernetes:
         args.registrySources?.includes("k8s") ||
@@ -352,6 +363,9 @@ export function startIngress(config) {
         // route on this origin that asks nothing of whoever is calling.
         sessionKey: config.registry.sessionKey,
         allowUncredentialed: config.registry.allowUncredentialed ?? false,
+        accessLog: config.registry.accessLogFile
+          ? createAccessLog({ file: config.registry.accessLogFile })
+          : null,
         proxy,
       })
     : null;
