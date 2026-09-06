@@ -91,7 +91,14 @@ function sh(command, args, options = {}) {
 function ssh(remoteCommand, { timeout = 60_000 } = {}) {
   return sh(
     "ssh",
-    ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", NODE1.ssh, remoteCommand],
+    [
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=10",
+      NODE1.ssh,
+      remoteCommand,
+    ],
     { timeout },
   );
 }
@@ -279,9 +286,11 @@ function agentServerEnv(stateRoot, sessionKey) {
     ...baseEnv(),
     PYTHONUTF8: "1",
     HOME: path.join(stateRoot, "home"),
-    UV_CACHE_DIR: process.env.UV_CACHE_DIR ?? path.join(realHome, ".cache", "uv"),
+    UV_CACHE_DIR:
+      process.env.UV_CACHE_DIR ?? path.join(realHome, ".cache", "uv"),
     UV_TOOL_DIR:
-      process.env.UV_TOOL_DIR ?? path.join(realHome, ".local", "share", "uv", "tools"),
+      process.env.UV_TOOL_DIR ??
+      path.join(realHome, ".local", "share", "uv", "tools"),
     UV_PYTHON_INSTALL_DIR:
       process.env.UV_PYTHON_INSTALL_DIR ??
       path.join(realHome, ".local", "share", "uv", "python"),
@@ -343,9 +352,15 @@ async function up() {
     node1: ssh(`cat ${NODE1.sessionKeyPath}`),
   };
   if (!state.keys.node1 || state.keys.node1.length < 8) {
-    throw new Error(`${NODE1.name}: session key at ${NODE1.sessionKeyPath} is unusable`);
+    throw new Error(
+      `${NODE1.name}: session key at ${NODE1.sessionKeyPath} is unusable`,
+    );
   }
   log(`ports ${JSON.stringify(state.ports)}`);
+
+  state.evidenceDir = path.join(dir, "evidence");
+  state.accessLogPath = path.join(state.evidenceDir, "proxy-access.jsonl");
+  state.tunnelMapPath = path.join(state.evidenceDir, "tunnel-map.json");
 
   stageNode1();
   state.node1Fingerprint = ssh(
@@ -374,7 +389,11 @@ async function up() {
   startService(state, {
     name: "static",
     command: `node scripts/static-server.mjs --port ${state.ports.static} --dir build --session-api-key ${shellQuote(state.keys.master)}`,
-    env: { ...baseEnv(), HOME: state.home, AGENT_CANVAS_DISABLE_TELEMETRY: "1" },
+    env: {
+      ...baseEnv(),
+      HOME: state.home,
+      AGENT_CANVAS_DISABLE_TELEMETRY: "1",
+    },
   });
 
   const agentServer = `http://127.0.0.1:${state.ports.masterAgentServer}`;
@@ -398,6 +417,9 @@ async function up() {
       `--registry-session-key ${shellQuote(state.keys.master)}`,
       `--registry-preseed ${shellQuote(state.node1Fingerprint)}`,
       "--registry-secret-provider file",
+      // The wire record every hop to a fleet node is verified against. It
+      // lives in the rig dir, never in the operator's ~/.openhands.
+      `--registry-access-log ${shellQuote(state.accessLogPath)}`,
     ].join(" "),
     env: {
       ...baseEnv(),
@@ -411,6 +433,27 @@ async function up() {
   state.baseUrl = base;
   state.node2Url = `http://127.0.0.1:${state.ports.node2AgentServer}`;
   state.node1Url = `http://127.0.0.1:${state.ports.node1Tunnel}`;
+
+  // The proxy records the host it dialled, which is a loopback port on this
+  // Mac. On its own that says nothing about which machine answered, so the
+  // forward behind it is written down alongside and the chain verifier
+  // refuses to pass a proxy line it cannot resolve through this map.
+  writeFileSync(
+    state.tunnelMapPath,
+    JSON.stringify(
+      {
+        [state.node1Url]: {
+          node: NODE1.name,
+          ssh: NODE1.ssh,
+          remote: `127.0.0.1:${NODE1.port}`,
+          fingerprint: state.node1Fingerprint,
+        },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
 
   await waitFor(
     "master agent server",
@@ -529,7 +572,13 @@ function enrolResultLine(output) {
 }
 
 function writeSecret(state, ref, secret) {
-  const filePath = path.join(state.home, ".openhands", "agent-canvas", "secrets", ref);
+  const filePath = path.join(
+    state.home,
+    ".openhands",
+    "agent-canvas",
+    "secrets",
+    ref,
+  );
   mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   writeFileSync(filePath, `${secret}\n`, { mode: 0o600 });
   log(`placed credential ${ref}`);
@@ -579,6 +628,9 @@ function summary(state) {
     dir: state.dir,
     baseUrl: state.baseUrl,
     ports: state.ports,
+    evidenceDir: state.evidenceDir,
+    accessLogPath: state.accessLogPath,
+    tunnelMapPath: state.tunnelMapPath,
     node1: {
       name: NODE1.name,
       url: state.node1Url,
@@ -595,9 +647,13 @@ function summary(state) {
 }
 
 function writeState(state) {
-  writeFileSync(path.join(state.dir, "state.json"), JSON.stringify(state, null, 2), {
-    mode: 0o600,
-  });
+  writeFileSync(
+    path.join(state.dir, "state.json"),
+    JSON.stringify(state, null, 2),
+    {
+      mode: 0o600,
+    },
+  );
   mkdirSync(path.dirname(POINTER_PATH), { recursive: true });
   writeFileSync(POINTER_PATH, JSON.stringify(state, null, 2), { mode: 0o600 });
 }
@@ -640,7 +696,10 @@ async function down() {
   }
 
   try {
-    rmSync(path.join(state.home, ".openhands"), { recursive: true, force: true });
+    rmSync(path.join(state.home, ".openhands"), {
+      recursive: true,
+      force: true,
+    });
     log("removed the rig secret store");
   } catch (error) {
     log(`could not remove the secret store: ${error.message}`);
@@ -665,7 +724,9 @@ async function clearFleetBackends(state) {
       "X-Session-API-Key": state.keys.master,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ misc_settings_diff: { fleet_backends: { entries: [] } } }),
+    body: JSON.stringify({
+      misc_settings_diff: { fleet_backends: { entries: [] } },
+    }),
   });
   if (!response.ok) {
     throw new Error(`settings patch returned ${response.status}`);
@@ -698,7 +759,9 @@ const COMMANDS = {
       } catch {
         alive = false;
       }
-      console.log(`${alive ? "up  " : "down"} ${service.name} pid ${service.pid}`);
+      console.log(
+        `${alive ? "up  " : "down"} ${service.name} pid ${service.pid}`,
+      );
     }
   },
 };
