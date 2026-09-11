@@ -4,6 +4,8 @@ import type { Duplex } from "node:stream";
 import { spawn, type ChildProcess } from "node:child_process";
 import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { once } from "node:events";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -268,6 +270,65 @@ describe("ingress.mjs CLI", () => {
     expect(output).toContain("http://localhost:8000");
     expect(output).toContain("/static");
     expect(output).toContain("http://localhost:3000");
+  });
+
+  it("writes the access log the --registry-access-log flag names", async () => {
+    // The unit tests cover the log module; this covers the wiring between the
+    // flag and it, which is the seam nothing else exercises.
+    const logDir = await mkdtemp(path.join(tmpdir(), "ingress-access-log-"));
+    const logFile = path.join(logDir, "evidence", "proxy-access.jsonl");
+
+    // Stands in for the agent server the registry stores its entries in.
+    const registryStore = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({ misc_settings: { fleet_backends: { entries: [] } } }),
+      );
+    });
+    const storePort = await listenOnLoopback(registryStore);
+    const port = await getFreePort();
+
+    const child = spawn(
+      process.execPath,
+      [
+        ingressScript,
+        "--port",
+        port.toString(),
+        "--default",
+        originForPort(storePort),
+        "--registry-session-key",
+        "master-key",
+        "--registry-agent-server",
+        originForPort(storePort),
+        "--registry-access-log",
+        logFile,
+      ],
+      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    try {
+      await waitForPort(port, child);
+      // Unauthenticated, so it never reaches a backend and needs no secret
+      // provider -- but it is a request the proxy handled, so it is recorded.
+      await fetch(`${originForPort(port)}/backend/some-entry/api/settings`);
+      await delay(200);
+
+      const lines = (await readFile(logFile, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(lines).toEqual([
+        expect.objectContaining({
+          url: "/backend/some-entry/api/settings",
+          outcome: "refused:401",
+          error: "unauthorized",
+        }),
+      ]);
+    } finally {
+      await stopChild(child);
+      registryStore.close();
+      await rm(logDir, { recursive: true, force: true });
+    }
   });
 });
 
