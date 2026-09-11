@@ -23,15 +23,26 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 
-/** Query parameters that may carry a credential, stripped before writing. */
-const REDACTED_QUERY_PARAMS = Object.freeze(["session_api_key"]);
+/**
+ * Query parameter names that may carry a credential.
+ *
+ * A predicate rather than a list of exact names. The proxy today reads only
+ * `session_api_key`, but this file's invariant is "no credential is ever
+ * written", and an invariant that holds only while every caller spells one
+ * parameter one way is not an invariant. A hand-rolled client, a future SDK,
+ * or an added `token=` leaks silently and permanently into an append-only
+ * file, so anything that looks like a secret goes.
+ */
+const CREDENTIAL_PARAM_RE = /key|token|secret|auth|password|session|cred/i;
 
 /**
- * The inbound URL with every credential-bearing query parameter removed.
+ * The inbound URL with every credential-bearing query parameter removed, and
+ * with the fragment dropped: a fragment never reaches a server, so anything
+ * in one is noise at best and a credential a client misplaced at worst.
  *
- * Returns the input unchanged when it will not parse, because a malformed URL
- * cannot be carrying a parsed credential and dropping the line entirely would
- * hide a request that did reach the proxy.
+ * Returns the input unchanged only when it will not parse at all, because a
+ * URL the parser rejects is one the proxy also rejected, and dropping the
+ * line entirely would hide a request that did reach the proxy.
  */
 export function redactUrl(rawUrl) {
   const raw = String(rawUrl ?? "");
@@ -41,14 +52,12 @@ export function redactUrl(rawUrl) {
   } catch {
     return raw;
   }
-  let redacted = false;
-  for (const param of REDACTED_QUERY_PARAMS) {
-    if (url.searchParams.has(param)) {
-      url.searchParams.delete(param);
-      redacted = true;
-    }
+  for (const name of [...url.searchParams.keys()]) {
+    if (CREDENTIAL_PARAM_RE.test(name)) url.searchParams.delete(name);
   }
-  if (!redacted) return raw;
+  // Always reconstructed, never returned raw: otherwise the same request is
+  // logged in two different shapes depending on whether anything was
+  // redacted, and `conversationIdFromPath` reads a different path in each.
   const query = url.searchParams.toString();
   return query ? `${url.pathname}?${query}` : url.pathname;
 }
@@ -84,7 +93,9 @@ export function conversationIdFromPath(pathname) {
 export function createAccessLog({
   file,
   now = () => new Date(),
-  append = (target, line) => appendFileSync(target, line, "utf8"),
+  // 0600: the log names every fleet machine an operator can reach and when.
+  // The mode only applies on creation, which is the case that matters here.
+  append = (target, line) => appendFileSync(target, line, { mode: 0o600 }),
   warn = console.warn,
 } = {}) {
   if (!file) throw new Error("createAccessLog requires a file");

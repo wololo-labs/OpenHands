@@ -13,17 +13,51 @@ describe("redactUrl", () => {
     ).toBe("/backend/abc/sockets/events/c1?x=1");
   });
 
-  it("leaves a URL with nothing to redact byte-identical", () => {
-    // The record is of what the caller asked for, so a URL that carries no
-    // credential must not be normalised into a different string.
+  it("keeps the parameters that carry no credential", () => {
     expect(redactUrl("/backend/abc/api/settings?limit=5")).toBe(
       "/backend/abc/api/settings?limit=5",
     );
   });
 
-  it("returns a malformed URL unchanged rather than dropping the line", () => {
-    expect(redactUrl("%")).toBe("%");
-    expect(redactUrl(undefined)).toBe("");
+  it("redacts by shape, not by one exact spelling", () => {
+    // The invariant is "no credential is ever written". One exact parameter
+    // name only holds it while every caller spells it that way.
+    for (const name of [
+      "SESSION_API_KEY",
+      "token",
+      "api_key",
+      "authorization",
+    ]) {
+      expect(redactUrl(`/backend/abc/x?${name}=SECRET`)).toBe("/backend/abc/x");
+    }
+  });
+
+  it("drops the fragment, which never reaches a server anyway", () => {
+    expect(redactUrl("/backend/abc/x#session_api_key=SECRET")).toBe(
+      "/backend/abc/x",
+    );
+  });
+
+  it("logs one shape whether or not anything was redacted", () => {
+    // Returning the raw string when nothing matched logged the same request
+    // two different ways, and `conversationIdFromPath` then read a different
+    // path in each.
+    expect(
+      redactUrl("/backend/abc/api/conversations/c1?a=b&session_api_key=x"),
+    ).toBe("/backend/abc/api/conversations/c1?a=b");
+    expect(redactUrl("/backend/abc/api/conversations/c1?a=b")).toBe(
+      "/backend/abc/api/conversations/c1?a=b",
+    );
+  });
+
+  it("normalises a request target the parser can still read", () => {
+    expect(redactUrl("%")).toBe("/%");
+  });
+
+  it("returns a target the parser rejects unchanged, rather than dropping the line", () => {
+    // A URL the parser refuses is one the proxy refused too, and losing the
+    // line would hide a request that did reach it.
+    expect(redactUrl("//%")).toBe("//%");
   });
 });
 
