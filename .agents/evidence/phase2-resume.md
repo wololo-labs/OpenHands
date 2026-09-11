@@ -8,6 +8,7 @@ Everything below was verified in-session unless a line says otherwise.
 | Thing | Value |
 |---|---|
 | Run nonce (published in issue #6) | `2adee20d08c4d4c5bf830a6b4c739f9b` |
+| Signing-key fingerprint (published in issue #6) | `SHA256:H5ez7DvuU+IhNEzHK8eELNf5520yO+ZWGn/TR8gEQmE` |
 | Phase 1 ticket | https://github.com/wololo-labs/OpenHands/issues/6 |
 | Phase 0 PR | https://github.com/wololo-labs/OpenHands/pull/5 |
 | Phase 0 issue | https://github.com/wololo-labs/OpenHands/issues/4 |
@@ -56,12 +57,16 @@ M1 through M8 are **not started**. M1 is "repo cloned on the node".
 node scripts/verify-fleet-chain.mjs \
   --range origin/main..<pr head> \
   --signing-key .agents/evidence/node-signing-key.pub \
+  --signing-key-fingerprint SHA256:H5ez7DvuU+IhNEzHK8eELNf5520yO+ZWGn/TR8gEQmE \
   --fingerprint SHA256:zCJmiJ7wModXHdGhaB0xktp+IBjT0NsgiNJaQtiIMHw \
   --run-nonce 2adee20d08c4d4c5bf830a6b4c739f9b \
   --proxy-log <rig.dir>/evidence/proxy-access.jsonl \
   --tunnel-map <rig.dir>/evidence/tunnel-map.json \
   --events-dir <evidence>/events
 ```
+
+Commits CI pushed are exempt only when named by sha with `--exempt <sha>`; nothing written
+inside a commit exempts it. An `--exempt` matching no commit fails the run.
 
 Merge with `--merge` or `--rebase`, never `--squash` (a squash commit is unsigned and
 untrailered, and breaks the chain). No `--admin`, no bypass.
