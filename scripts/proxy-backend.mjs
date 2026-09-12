@@ -379,13 +379,32 @@ export function createBackendProxy({
         return;
       }
 
-      accessLog?.record({
-        url: inboundUrl,
-        method: req.method,
-        kind: "http",
-        entry: target.entry,
-        credentialInjected: Boolean(target.credential),
-      });
+      // Recorded when the response is done, never when the dial starts. A
+      // line written before `proxyHttp` says only that the master addressed
+      // the node, and the chain verifier reads these lines as proof the node
+      // answered: a 404 from the node, a refused connection and a real turn
+      // would all be written identically. `res.statusCode` is the node's own
+      // status here, because the proxy pipes it through untouched; a transport
+      // failure surfaces as the 502 `writeProxyError` writes.
+      if (accessLog) {
+        let recorded = false;
+        const settle = () => {
+          if (recorded) return;
+          recorded = true;
+          accessLog.record({
+            url: inboundUrl,
+            method: req.method,
+            kind: "http",
+            entry: target.entry,
+            credentialInjected: Boolean(target.credential),
+            outcome: res.writableFinished
+              ? `proxied:${res.statusCode}`
+              : `aborted:${res.statusCode}`,
+          });
+        };
+        res.on("finish", settle);
+        res.on("close", settle);
+      }
 
       req.url = applyCredentialToPath(
         parsed.pathname,
@@ -412,7 +431,7 @@ export function createBackendProxy({
           url: inboundUrl,
           method: req.method,
           kind: "upgrade",
-          outcome: "refused",
+          outcome: `refused:${error instanceof RegistryError ? error.status : 500}`,
           error: error instanceof RegistryError ? error.code : "internal_error",
         });
         // There is no useful status line to send on a rejected upgrade.
@@ -420,13 +439,21 @@ export function createBackendProxy({
         return;
       }
 
-      accessLog?.record({
-        url: inboundUrl,
-        method: req.method,
-        kind: "upgrade",
-        entry: target.entry,
-        credentialInjected: Boolean(target.credential),
-      });
+      // Same rule as the HTTP path: the record is of what the node answered.
+      // An upgrade has no `res`, so the status comes from the upstream
+      // response the proxy saw -- 101 when the node accepted the socket, its
+      // own status when it refused one.
+      const onUpstreamStatus = accessLog
+        ? (status) =>
+            accessLog.record({
+              url: inboundUrl,
+              method: req.method,
+              kind: "upgrade",
+              entry: target.entry,
+              credentialInjected: Boolean(target.credential),
+              outcome: status === null ? "upstream_error" : `proxied:${status}`,
+            })
+        : null;
 
       req.url = applyCredentialToPath(
         parsed.pathname,
@@ -435,7 +462,9 @@ export function createBackendProxy({
         { inQuery: true },
       );
       applyCredential(req.headers, target.credential);
-      proxy.proxyWebSocket(req, socket, head, target.entry.host);
+      proxy.proxyWebSocket(req, socket, head, target.entry.host, {
+        onUpstreamStatus,
+      });
     },
   };
 }

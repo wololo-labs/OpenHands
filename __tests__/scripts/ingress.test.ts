@@ -330,6 +330,39 @@ describe("ingress.mjs CLI", () => {
       await rm(logDir, { recursive: true, force: true });
     }
   });
+
+  it("says so when the access log is asked for and the registry is off", async () => {
+    // Without a registry session key there is no proxy to log, so the flag is
+    // a no-op. Silently, an operator believes there is evidence where there
+    // is none.
+    const port = await getFreePort();
+    const child = spawn(
+      process.execPath,
+      [
+        ingressScript,
+        "--port",
+        port.toString(),
+        "--default",
+        "http://127.0.0.1:9",
+        "--registry-access-log",
+        "/tmp/never-written.jsonl",
+      ],
+      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+
+    try {
+      await waitForPort(port, child);
+      expect(stderr).toContain("--registry-access-log");
+      expect(stderr).toContain("nothing will be logged");
+    } finally {
+      await stopChild(child);
+    }
+  });
 });
 
 describe("ingress proxy functionality", () => {

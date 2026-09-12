@@ -366,6 +366,17 @@ was injected; a request the proxy refused is recorded too, with its status,
 because "the node was never reached" is a claim the record has to be able to
 settle.
 
+`outcome` is the node's own answer, not the master's intent: `proxied:<status>`
+once the response completed (`proxied:101` for an accepted event socket),
+`refused:<status>` for a request the proxy itself turned away, `upstream_error`
+for an upgrade that never reached the node. That distinction is load-bearing.
+The conversation id is read from the caller's path, so anyone holding the
+master key can address `/backend/<node>/api/conversations/<any id>` at a real
+node and produce a line naming a conversation in which nothing ever ran. What
+stops that being evidence is the node's own status landing in the record: it
+404s, and the verifier does not count it. A log written before `outcome`
+carried a status (a bare `proxied`) verifies as broken rather than as proof.
+
 The caller's session key is deleted from the URL before anything is written. A
 browser cannot set a header on a WebSocket handshake, so the SDK passes the key
 as a query parameter, and the inbound URL of every upgrade therefore carries a
@@ -376,12 +387,12 @@ fragment is dropped.
 `scripts/verify-fleet-chain.mjs` reads that log back. It holds every commit in a
 range to four links, and exits 0 only if all of them hold for all of them:
 
-| Link      | What it checks                                                                                                                                                                                 |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| signature | a good SSH signature from a key generated on the node. The only link that covers `git push`, which is not proxy-observable                                                                     |
-| trailers  | `Fleet-Conversation` and `Fleet-Run`, the nonce matching the one published before the work started                                                                                             |
-| proxy     | that conversation in the access log, credential injected, against the node's fingerprint, before the commit, with the tunnel map agreeing that the loopback port forwards to that same machine |
-| events    | an agent-sourced event in that conversation naming the commit's subject                                                                                                                        |
+| Link      | What it checks                                                                                                                                                                                                                               |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| signature | a good SSH signature from a key generated on the node. The only link that covers `git push`, which is not proxy-observable                                                                                                                   |
+| trailers  | `Fleet-Conversation` and `Fleet-Run`, the nonce matching the one published before the work started                                                                                                                                           |
+| proxy     | that conversation in the access log, answered by the node (`proxied:101/2xx/3xx`), credential injected, against the node's fingerprint, before the commit, with the tunnel map agreeing that the loopback port forwards to that same machine |
+| events    | an agent-sourced event in that conversation naming the commit's subject                                                                                                                                                                      |
 
 Two properties are what make it worth running rather than reading. The key is
 pinned by `--signing-key-fingerprint`, which is meant to come from the run's
