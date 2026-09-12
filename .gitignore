@@ -44,3 +44,9 @@ build-fresh/
 /resources/bin/
 # Downloaded Node.js distribution (populated by `npm run download-node` before packaging)
 /resources/node/
+
+# Local MCP server wiring, written per checkout by the session runner
+.mcp.json
+
+# Fleet-run evidence dumps (event exports, video, proxy logs copied out of a rig)
+.agents/evidence/runtime/
