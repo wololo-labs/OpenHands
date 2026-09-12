@@ -1,5 +1,6 @@
 import { createServer, request, type Server } from "node:http";
 import { connect as netConnect, type AddressInfo, type Socket } from "node:net";
+import { networkInterfaces } from "node:os";
 import type { Duplex } from "node:stream";
 import { spawn, type ChildProcess } from "node:child_process";
 import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
@@ -26,6 +27,20 @@ const repoRoot = path.resolve(
 
 const ingressScript = path.join(repoRoot, "scripts", "ingress.mjs");
 const loopbackHost = "127.0.0.1";
+
+/**
+ * An IPv4 address of this machine that is not loopback — the address a peer
+ * on the same network would dial. `null` on a host that has none, where the
+ * bind assertions cannot be made and say so instead of passing vacuously.
+ */
+function nonLoopbackAddress(): string | null {
+  for (const addresses of Object.values(networkInterfaces())) {
+    for (const address of addresses ?? []) {
+      if (address.family === "IPv4" && !address.internal) return address.address;
+    }
+  }
+  return null;
+}
 
 function originForPort(port: number) {
   return `http://${loopbackHost}:${port}`;
@@ -78,9 +93,9 @@ async function getFreePort() {
   }
 }
 
-async function canConnect(port: number) {
+async function canConnect(port: number, host: string = loopbackHost) {
   return new Promise<boolean>((resolve) => {
-    const socket = netConnect({ host: loopbackHost, port });
+    const socket = netConnect({ host, port });
     let settled = false;
     const finish = (connected: boolean) => {
       if (settled) {
@@ -468,6 +483,75 @@ describe("ingress malformed request lines", () => {
       "the ingress died parsing a malformed request line for /server_info",
     ).toBeNull();
     expect((await getJson(`${originForPort(port)}/anything`)).status).toBe(200);
+  });
+});
+
+describe("ingress --host", () => {
+  let ingressProcess: ChildProcess | undefined;
+
+  afterEach(async () => {
+    await stopChild(ingressProcess);
+    ingressProcess = undefined;
+  });
+
+  async function startIngressOn(hostArgs: string[], env: NodeJS.ProcessEnv = {}) {
+    const port = await getFreePort();
+    ingressProcess = spawn(
+      process.execPath,
+      [ingressScript, "--port", port.toString(), "--default", "http://127.0.0.1:1", ...hostArgs],
+      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } },
+    );
+    await waitForPort(port, ingressProcess);
+    return port;
+  }
+
+  /**
+   * This process serves /api/registry and /backend/:id — the fleet's
+   * credentials. Before --host existed it called `server.listen(port)` with no
+   * address, which binds every interface, so every machine on the network
+   * could reach them.
+   */
+  it("binds loopback only by default", async () => {
+    const external = nonLoopbackAddress();
+    expect(
+      external,
+      "this host has no non-loopback IPv4, so the bind cannot be proven here",
+    ).not.toBeNull();
+
+    const port = await startIngressOn([]);
+
+    expect(await canConnect(port, loopbackHost)).toBe(true);
+    expect(await canConnect(port, external as string)).toBe(false);
+  });
+
+  it("binds every interface when asked to, explicitly", async () => {
+    const external = nonLoopbackAddress();
+    expect(external).not.toBeNull();
+
+    const port = await startIngressOn(["--host", "0.0.0.0"]);
+
+    expect(await canConnect(port, external as string)).toBe(true);
+  });
+
+  it("takes the bind address from INGRESS_HOST too", async () => {
+    const external = nonLoopbackAddress();
+    expect(external).not.toBeNull();
+
+    const port = await startIngressOn([], { INGRESS_HOST: "0.0.0.0" });
+
+    expect(await canConnect(port, external as string)).toBe(true);
+  });
+
+  it("lets the flag win over the environment", async () => {
+    const external = nonLoopbackAddress();
+    expect(external).not.toBeNull();
+
+    const port = await startIngressOn(["--host", "127.0.0.1"], {
+      INGRESS_HOST: "0.0.0.0",
+    });
+
+    expect(await canConnect(port, loopbackHost)).toBe(true);
+    expect(await canConnect(port, external as string)).toBe(false);
   });
 });
 
