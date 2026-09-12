@@ -26,6 +26,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { mkdirSync, rmSync } from "node:fs";
 
 import { expect, test, type APIRequestContext } from "@playwright/test";
 
@@ -250,8 +251,13 @@ test("forgery: a conversation that never ran leaves a line that proves nothing",
 test("forgery: the verifier refuses a signing key the master holds", () => {
   // Link 1 is the only one that tells the node apart from this Mac, and it
   // holds only while the node signs with a key this machine does not have.
-  // Pointing the verifier at a locally generated key is the whole attack.
-  const keyDir = `${rig.dir}/evidence`;
+  // Pointing the verifier at a locally generated key is the whole attack, and
+  // the published fingerprint is what has to stop it.
+  const evidence = `${rig.dir}/evidence`;
+  mkdirSync(`${evidence}/events`, { recursive: true });
+  const keyPath = `${evidence}/master-held-key`;
+  rmSync(keyPath, { force: true });
+  rmSync(`${keyPath}.pub`, { force: true });
   execFileSync("ssh-keygen", [
     "-t",
     "ed25519",
@@ -260,8 +266,11 @@ test("forgery: the verifier refuses a signing key the master holds", () => {
     "-C",
     "master-held",
     "-f",
-    `${keyDir}/master-held-key`,
+    keyPath,
   ]);
+  const masterHeld = execFileSync("ssh-keygen", ["-lf", `${keyPath}.pub`], {
+    encoding: "utf8",
+  }).split(/\s+/)[1];
 
   let exitCode = 0;
   let output = "";
@@ -272,8 +281,9 @@ test("forgery: the verifier refuses a signing key the master holds", () => {
         "scripts/verify-fleet-chain.mjs",
         "--range",
         "HEAD~1..HEAD",
+        // The key the master generated, offered as the node's.
         "--signing-key",
-        `${keyDir}/master-held-key.pub`,
+        `${keyPath}.pub`,
         // The fingerprint published before the run, which is the node's.
         "--signing-key-fingerprint",
         NODE_FINGERPRINT,
@@ -281,26 +291,33 @@ test("forgery: the verifier refuses a signing key the master holds", () => {
         NODE_FINGERPRINT,
         "--run-nonce",
         "0".repeat(32),
+        // Everything else is the run's real evidence, so the key is the only
+        // thing wrong. Feeding it junk would make it exit non-zero for a
+        // reason that has nothing to do with the attack.
         "--proxy-log",
-        "/dev/null",
+        rig.accessLogPath as string,
         "--tunnel-map",
-        "/dev/null",
+        rig.tunnelMapPath as string,
         "--events-dir",
-        keyDir,
+        `${evidence}/events`,
       ],
       { encoding: "utf8", stdio: "pipe" },
     );
   } catch (error) {
-    const failure = error as { status?: number; stdout?: string; stderr?: string };
+    const failure = error as {
+      status?: number;
+      stdout?: string;
+      stderr?: string;
+    };
     exitCode = failure.status ?? 0;
     output = `${failure.stdout ?? ""}${failure.stderr ?? ""}`;
   }
 
-  expect(
-    exitCode,
-    "a key the master generated verified as the node's",
-  ).not.toBe(0);
-  expect(output.toLowerCase()).toMatch(/fingerprint/);
+  expect(exitCode, "a key the master generated verified as the node's").toBe(2);
+  // Named, both of them: the operator has to be able to see which key was
+  // offered and which one the published record says it should have been.
+  expect(output).toContain(masterHeld);
+  expect(output).toContain(NODE_FINGERPRINT);
 });
 
 test("forgery: a registration flood cannot crowd out a real node", async ({
@@ -345,9 +362,13 @@ test("forgery: a registration flood cannot crowd out a real node", async ({
   ).toEqual(before.map((entry) => entry.id).sort());
 
   // And the fleet still works, which is the part a nonce table exhausted by
-  // junk would have broken.
+  // junk would have broken. Whichever entry is active now: this file runs
+  // after the assertions that revoke one, so naming an entry up front would
+  // assert against a machine that is meant to be refused.
+  const working = after.find((entry) => entry.state === "active");
+  expect(working, "no active entry left to prove the fleet still works").toBeDefined();
   const response = await request.get(
-    `${rig.baseUrl}/backend/${rig.entries.node1.id}/server_info`,
+    `${rig.baseUrl}/backend/${(working as RigEntry).id}/server_info`,
     { headers: masterAuth, failOnStatusCode: false },
   );
   expect(response.status()).toBe(200);

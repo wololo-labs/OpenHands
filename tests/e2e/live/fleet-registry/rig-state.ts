@@ -10,6 +10,7 @@ import path from "node:path";
  */
 export interface RigEntry {
   id: string;
+  source?: string;
   name: string;
   host: string;
   fingerprint: string;
@@ -18,7 +19,15 @@ export interface RigEntry {
   version: string | null;
 }
 
+/**
+ * Which reachability profile the rig was brought up in. The spec reads this
+ * rather than an environment variable, so it can never run the k8s assertions
+ * against two VMs and call the result green.
+ */
+export type RigProfile = "tailnet" | "k8s";
+
 export interface RigState {
+  profile: RigProfile;
   rigId: string;
   dir: string;
   baseUrl: string;
@@ -27,14 +36,35 @@ export interface RigState {
   node1Fingerprint: string;
   node2Fingerprint: string;
   ports: {
-    masterAgentServer: number;
-    node2AgentServer: number;
-    static: number;
-    ingress: number;
-    node1Tunnel: number;
+    masterAgentServer?: number;
+    static?: number;
+    ingress?: number;
+    /** k8s only: the local end of the rig-managed `kubectl port-forward`. */
+    portForward?: number;
   };
-  keys: { master: string; node1: string; node2: string };
+  /**
+   * `node1`/`node2` exist only in the tailnet profile, where each machine has
+   * a session key of its own that must never reach the browser. The k8s
+   * profile distributes no keys at all.
+   */
+  keys: { master: string; node1?: string; node2?: string };
   entries: { node1: RigEntry; node2: RigEntry };
+
+  /** tailnet only: the `tailscale serve` URL nodes enrol against. */
+  masterServeUrl?: string;
+
+  /** The wire record of every hop to a fleet node, and what vouches for it. */
+  evidenceDir: string;
+  accessLogPath: string;
+  tunnelMapPath: string;
+
+  /** k8s only. */
+  kubeconfig?: string;
+  namespace?: string;
+  releases?: { canvas: string; pool: string };
+  canvasService?: string;
+  poolService?: string;
+  sourceIntervalMs?: number;
 }
 
 export const RIG_STATE_PATH = path.resolve(

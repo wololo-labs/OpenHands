@@ -46,6 +46,10 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { credRefFor } from "../../../../scripts/registry/store.mjs";
+// Resolution for MagicDNS names, which this Mac's system resolver refuses.
+// The rig health-checks each node on its published address before enrolling
+// it, so this process needs the same resolution the master does.
+import "./magicdns.mjs";
 
 const REPO_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -128,6 +132,9 @@ const K8S = {
   // Short enough that "the entry list changed within one poll" is an
   // assertion a test can make without outliving its own timeout.
   sourceIntervalMs: Number(process.env.FLEET_RIG_K8S_POLL_MS ?? 5000),
+  // `service.port` in helm/agent-canvas/values.yaml. It is what the
+  // port-forward targets and what a discovered entry's host carries.
+  servicePort: Number(process.env.FLEET_RIG_K8S_SERVICE_PORT ?? 8000),
 };
 
 const AGENT_SERVER_VERSION = JSON.parse(
@@ -256,14 +263,25 @@ function stageEnrolmentClient(node) {
     [
       "-o",
       "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=10",
+      // A hung transfer here is indistinguishable from a slow one, and this
+      // runs unattended: without a bound, one wedged ssh stalls the whole run
+      // and nothing ever says so.
+      "-o",
+      "ServerAliveInterval=10",
+      "-o",
+      "ServerAliveCountMax=3",
       node.ssh,
       `rm -rf ${node.stagingDir} && mkdir -p ${node.stagingDir} && tar xzf - -C ${node.stagingDir}`,
     ],
-    { input: tar.stdout, encoding: "buffer" },
+    { input: tar.stdout, encoding: "buffer", timeout: 120_000 },
   );
   if (push.status !== 0) {
     throw new Error(
-      `could not stage the enrolment client on ${node.name}: ${push.stderr}`,
+      `could not stage the enrolment client on ${node.name}` +
+        `${push.signal ? ` (killed after ${push.signal}: it hung)` : ""}: ` +
+        `${push.stderr}`,
     );
   }
   log(`staged the enrolment client on ${node.name}`);
@@ -470,8 +488,9 @@ function baseEnv() {
 // Profile tailnet: two real VMs on a private overlay
 // ───────────────────────────────────────────────────────────────────────────
 
-async function upTailnet() {
+async function upTailnet(onState = () => {}) {
   const state = newState("tailnet");
+  onState(state);
 
   const taken = new Set();
   state.ports = {
@@ -755,10 +774,28 @@ function helm(state, args) {
  * which is not a thing this rig will do.
  */
 function installK3s(state) {
+  // The image is unpacked into the cluster's own store, and a VM that runs
+  // out of disk half way through leaves a wedged containerd and a failure
+  // that reads as something else entirely. Check first, say the number.
+  const freeMb = Number(
+    ssh(K8S.ssh, "df -Pm / | awk 'NR==2 {print $4}'").trim(),
+  );
+  const NEEDED_MB = 8_000;
+  if (!Number.isFinite(freeMb) || freeMb < NEEDED_MB) {
+    throw new Error(
+      `${K8S.ssh} has ${freeMb} MB free on /, and k3s plus this image need ` +
+        `about ${NEEDED_MB}. Free space on the VM before running this profile.`,
+    );
+  }
+  log(`${freeMb} MB free on the VM`);
+
   log("installing k3s on the VM (from nothing)");
+  // `sudo` starts a fresh environment, so INSTALL_K3S_EXEC has to be set
+  // inside it rather than in front of the pipeline.
   ssh(
     K8S.ssh,
-    `curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--tls-san ${K8S.apiAddress} --write-kubeconfig-mode 644" sudo -n sh -`,
+    "curl -sfL https://get.k3s.io | sudo -n env " +
+      `INSTALL_K3S_EXEC='--tls-san ${K8S.apiAddress} --write-kubeconfig-mode 644' sh -`,
     { timeout: 600_000 },
   );
   ssh(
@@ -815,8 +852,106 @@ function importImage(state) {
   log(`imported ${repository}:${tag}`);
 }
 
-async function upK8s() {
+/**
+ * Replaces the pod's ServiceAccount token with one that expires in ten
+ * minutes, so a real rotation happens inside a test run.
+ *
+ * The thing under test is that the registry re-reads the token every cycle
+ * rather than holding the one it read at boot. In a normal cluster that token
+ * lives an hour and the kubelet rewrites it at about 80% of its life, so the
+ * bug takes roughly 50 minutes to appear and a test would have to wait that
+ * long — or fake the rotation, which proves nothing about the kubelet.
+ *
+ * Ten minutes is the shortest expiry the TokenRequest API accepts. The
+ * mechanism is the real one: a projected volume, rewritten in place by the
+ * kubelet, at the path the source reads.
+ */
+function shortenServiceAccountToken(state) {
+  const EXPIRY_SECONDS = 600;
+  const SA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount";
+  // A strategic merge, not a JSON patch: with persistence disabled the
+  // container has no volumeMounts array at all, and `add .../volumeMounts/-`
+  // would fail on the missing path. Strategic merge merges both lists by
+  // name, so this adds without replacing anything the chart put there.
+  const patch = {
+    spec: {
+      template: {
+        spec: {
+          volumes: [
+            {
+              name: "short-lived-sa-token",
+              projected: {
+                sources: [
+                  {
+                    serviceAccountToken: {
+                      path: "token",
+                      expirationSeconds: EXPIRY_SECONDS,
+                    },
+                  },
+                  // The same two files the kubelet's own mount provides, so
+                  // readInClusterConfig finds what it expects — including the
+                  // cluster CA the dispatcher is built from.
+                  {
+                    configMap: {
+                      name: "kube-root-ca.crt",
+                      items: [{ key: "ca.crt", path: "ca.crt" }],
+                    },
+                  },
+                  {
+                    downwardAPI: {
+                      items: [
+                        {
+                          path: "namespace",
+                          fieldRef: { fieldPath: "metadata.namespace" },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          containers: [
+            {
+              name: "agent-canvas",
+              volumeMounts: [
+                {
+                  name: "short-lived-sa-token",
+                  mountPath: SA_PATH,
+                  readOnly: true,
+                },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  };
+
+  kubectl(state, [
+    "-n",
+    state.namespace,
+    "patch",
+    "statefulset",
+    state.canvasService,
+    "-p",
+    JSON.stringify(patch),
+  ]);
+  kubectl(state, [
+    "-n",
+    state.namespace,
+    "rollout",
+    "status",
+    `statefulset/${state.canvasService}`,
+    "--timeout=10m",
+  ]);
+  log(`the canvas pod's ServiceAccount token now expires in ${EXPIRY_SECONDS}s`);
+  return EXPIRY_SECONDS;
+}
+
+async function upK8s(onState = () => {}) {
   const state = newState("k8s");
+  onState(state);
   state.keys = { master: `master-${randomBytes(24).toString("hex")}` };
   state.namespace = K8S.namespace;
   state.releases = { canvas: K8S.canvasRelease, pool: K8S.poolRelease };
@@ -895,6 +1030,10 @@ async function upK8s() {
     "secrets.sessionApiKey.existingSecret=fleet-session-key",
     "--set",
     "secrets.sessionApiKey.key=session-api-key",
+    // The kubelet's own mount is turned off so the rig can replace it with a
+    // short-lived one below; see shortenServiceAccountToken.
+    "--set",
+    "serviceAccount.automountServiceAccountToken=false",
     "--wait",
     "--timeout",
     "10m",
@@ -903,6 +1042,8 @@ async function upK8s() {
   state.canvasService = `${state.releases.canvas}-agent-canvas`;
   state.poolService = `${state.releases.pool}-agent-canvas`;
 
+  state.tokenExpirySeconds = shortenServiceAccountToken(state);
+
   // The viewer's path into the cluster. Not the overlay: this profile exists
   // to prove no overlay is needed, so the canvas is reached exactly the way a
   // platform engineer reaches any in-cluster service.
@@ -910,7 +1051,7 @@ async function upK8s() {
   state.ports = { portForward: await freePort(taken) };
   startService(state, {
     name: "port-forward",
-    command: `kubectl --kubeconfig ${shellQuote(state.kubeconfig)} -n ${state.namespace} port-forward svc/${state.canvasService} ${state.ports.portForward}:80`,
+    command: `kubectl --kubeconfig ${shellQuote(state.kubeconfig)} -n ${state.namespace} port-forward svc/${state.canvasService} ${state.ports.portForward}:${K8S.servicePort}`,
     env: baseEnv(),
   });
   state.baseUrl = `http://127.0.0.1:${state.ports.portForward}`;
@@ -1145,8 +1286,35 @@ function requestedProfile() {
 }
 
 const COMMANDS = {
+  /**
+   * A half-built rig is worse than none: its processes keep running, its
+   * `tailscale serve` mapping keeps pointing at a dead port, and the next
+   * attempt inherits both. So a failed bring-up tears down what it created
+   * before it reports the failure, and the failure is what the caller sees.
+   */
   async up() {
-    await PROFILES[requestedProfile()]();
+    const profile = requestedProfile();
+    let state;
+    try {
+      state = await PROFILES[profile](
+        // The partially-built state, handed over as soon as it exists, so a
+        // failure has something to tear down.
+        (partial) => {
+          state = partial;
+        },
+      );
+    } catch (error) {
+      if (state) {
+        log("bring-up failed; tearing down what it created");
+        writeState(state);
+        try {
+          await down();
+        } catch (teardownError) {
+          log(`teardown after failure also failed: ${teardownError.message}`);
+        }
+      }
+      throw error;
+    }
   },
   down,
   /**
