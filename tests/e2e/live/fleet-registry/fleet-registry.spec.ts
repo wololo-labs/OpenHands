@@ -149,8 +149,13 @@ const SKIP_ONBOARDING = () => {
  * master shows it on a fresh browser regardless of what localStorage says.
  */
 test.beforeAll(async ({ request }) => {
+  // Through the front door, not at the agent server directly: in the k8s
+  // profile the agent server is inside the cluster and this machine has no
+  // route to it at all. `/api` is in the front door's route table in both
+  // profiles, which is the whole reason the registry defaults to storing
+  // itself there.
   const response = await request.patch(
-    `http://127.0.0.1:${rig.ports.masterAgentServer}/api/settings`,
+    `${rig.baseUrl}/api/settings`,
     {
       headers: masterAuth,
       data: {
@@ -435,10 +440,24 @@ test("the browser holds no fleet credential and sends none", async ({
   // Drive real traffic at both entries so the assertion has something to bite
   // on: health probes for the fleet rows run as soon as the list hydrates.
   await openManageBackends(page);
-  await expect(page.getByTestId(`manage-backends-status-${NODE1}`)).toHaveText(
-    "Connected",
-    { timeout: 30_000 },
-  );
+  await expect
+    .poll(() => proxied.length, {
+      timeout: 30_000,
+      message: "no browser request reached the proxy to inspect",
+    })
+    .toBeGreaterThan(0);
+
+  if (TAILNET) {
+    // A credential was placed for this entry out of band, so the row reports a
+    // working connection. In the k8s profile no key is distributed at all, and
+    // the row says so — "Disconnected (check API key)" is the honest answer for
+    // a machine the fleet can list and reach but not authenticate to. What is
+    // asserted below holds either way: whatever the browser sent, it was the
+    // master's key and never a node's.
+    await expect(
+      page.getByTestId(`manage-backends-status-${NODE1}`),
+    ).toHaveText("Connected", { timeout: 30_000 });
+  }
 
   const storage = await page.evaluate(() => {
     const dump = (store: Storage) =>

@@ -790,6 +790,22 @@ function installK3s(state) {
   log(`${freeMb} MB free on the VM`);
 
   log("installing k3s on the VM (from nothing)");
+  // The kubelet evicts on *percentage* free by default — 15% of the disk — and
+  // this VM has a large disk that is nearly full, so a node with gigabytes
+  // free still takes a `disk-pressure` taint and schedules nothing. The
+  // failure surfaces as a pod stuck Pending with an untolerated taint, which
+  // reads like a scheduling problem and is not one. Absolute thresholds say
+  // what actually matters: whether there is room for another pod.
+  ssh(
+    K8S.ssh,
+    "sudo -n mkdir -p /etc/rancher/k3s && " +
+      "printf '%s\\n' " +
+      "'kubelet-arg:' " +
+      `'  - "eviction-hard=imagefs.available<1Gi,nodefs.available<1Gi"' ` +
+      `'  - "eviction-minimum-reclaim=imagefs.available=0,nodefs.available=0"' ` +
+      "| sudo -n tee /etc/rancher/k3s/config.yaml >/dev/null",
+  );
+
   // `sudo` starts a fresh environment, so INSTALL_K3S_EXEC has to be set
   // inside it rather than in front of the pipeline.
   ssh(
@@ -1245,6 +1261,9 @@ async function downK8s(state) {
   trySsh(K8S.ssh, "sudo -n /usr/local/bin/k3s-uninstall.sh", {
     timeout: 300_000,
   });
+  // k3s-uninstall.sh leaves /etc/rancher behind. This run wrote the config in
+  // it, so this run removes it: "restored to a plain VM" has to mean it.
+  trySsh(K8S.ssh, "sudo -n rm -rf /etc/rancher/k3s/config.yaml");
   log("k3s uninstalled; the VM is a plain VM again");
 }
 
