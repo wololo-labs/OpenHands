@@ -1,37 +1,42 @@
 #!/usr/bin/env node
 /**
- * Live rig for the fleet registry.
+ * Live rig for the fleet registry, in two reachability profiles.
  *
- * Stands up a throwaway master stack (agent server + ingress + registry +
- * injecting proxy + static canvas) and a throwaway second agent server, enrols
- * two real nodes into it, and writes everything the Playwright spec needs to
- * `.tmp/fleet-rig.json`.
+ *   node tests/e2e/live/fleet-registry/rig.mjs up   --profile tailnet
+ *   node tests/e2e/live/fleet-registry/rig.mjs down --profile tailnet
+ *   node tests/e2e/live/fleet-registry/rig.mjs up   --profile k8s
+ *   node tests/e2e/live/fleet-registry/rig.mjs down --profile k8s
  *
- *   node tests/e2e/live/fleet-registry/rig.mjs up
- *   node tests/e2e/live/fleet-registry/rig.mjs status
- *   node tests/e2e/live/fleet-registry/rig.mjs down
+ * The registry is transport-neutral: an entry is a URL plus a credential
+ * reference, and the proxy dials whatever URL the entry carries. So the
+ * question is never "which tunnel" but how a node becomes dialable at all,
+ * and these are the two answers that need no new code:
  *
- * The fleet is exactly two entries:
+ *   ┌─ PROFILE tailnet ──────────────┐   ┌─ PROFILE k8s ──────────────────┐
+ *   │ two real VMs on a private      │   │ one real k3s cluster, built    │
+ *   │ overlay                        │   │ from nothing                   │
+ *   │ https://<node>.<tailnet>:8443  │   │ http://<svc>.<ns>.svc:<port>   │
+ *   │ push enrolment, SSH host key   │   │ pull source, Service label     │
+ *   │ hetzner pre-seeded -> active   │   │ no enrolment, no key, no       │
+ *   │ gcp-1 unseeded   -> pending    │   │ fingerprint pre-seeded         │
+ *   │ master: this Mac, serve :8444  │   │ master: in-cluster, port-fwd   │
+ *   └────────────────────────────────┘   └────────────────────────────────┘
  *
- *   node 1  a real remote agent server, pre-seeded, lands `active`
- *   node 2  a local throwaway agent server with a generated key, not
- *           pre-seeded, lands `pending`
+ * **SSH is never a transport in either profile.** In `tailnet` it runs the
+ * enrolment client on the machine that holds the host key, because only that
+ * machine can sign for itself; in `k8s` it installs k3s once, the way a
+ * cloud-init script or a platform team would. Every hop the registry makes is
+ * over the profile's own reachability.
  *
- * Isolation is the point of the shape here. Every process runs on a random
- * port in 39000-39999, writes under `$TMPDIR/fleet-rig-<ts>`, and runs with
- * `HOME` pointed inside that directory so the `file` secret provider and
- * `--generate-key` cannot reach the operator's real `~/.openhands`. Teardown
- * kills recorded PIDs only; there is no pattern-matched kill anywhere in this
- * file.
- *
- * The master reaches node 1 through an SSH tunnel rather than its published
- * tailnet URL because `tailscale serve` terminates TLS on the MagicDNS name
- * and MagicDNS does not resolve on every client (see docs/registry.md). The
- * tunnel is carried over the tailnet address, so the hop is still
- * machine-to-machine over the tailnet; only name resolution moves.
+ * Isolation is the shape of this file. Every process runs on a random port in
+ * 39000-39999, writes under `$TMPDIR/fleet-rig-<ts>`, and runs with `HOME`
+ * pointed inside that directory so the `file` secret provider cannot reach the
+ * operator's real `~/.openhands`. Teardown kills recorded PIDs only; there is
+ * no pattern-matched kill anywhere in this file, and nothing it did not create
+ * is ever removed.
  */
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -49,32 +54,91 @@ const REPO_ROOT = path.resolve(
 const POINTER_PATH = path.join(REPO_ROOT, ".tmp", "fleet-rig.json");
 const PORT_RANGE = { min: 39000, max: 39999 };
 
-const NODE1 = {
-  name: process.env.FLEET_RIG_NODE1_NAME ?? "claude-hetzner",
-  ssh: process.env.FLEET_RIG_NODE1_SSH ?? "claude@100.125.222.64",
-  // Port the node's own ingress listens on, loopback-only on that host.
-  port: process.env.FLEET_RIG_NODE1_PORT ?? "8000",
-  keyPath:
-    process.env.FLEET_RIG_NODE1_KEY_PATH ?? "/etc/ssh/ssh_host_ed25519_key",
-  sessionKeyPath:
-    process.env.FLEET_RIG_NODE1_SESSION_KEY_PATH ??
-    "~/.openhands/canvas-api-key",
-  stagingDir:
-    process.env.FLEET_RIG_NODE1_STAGING_DIR ??
-    "/home/claude/.cache/agent-canvas-enrol-rig",
-  // Commit signing, checked before a run rather than after it. The
-  // fingerprint is the one published in the run's anchor comment.
-  signingKeyPath:
-    process.env.FLEET_RIG_NODE1_SIGNING_KEY_PATH ??
-    "/home/claude/.ssh/fleet-node-signing.pub",
-  signingKeyFingerprint:
-    process.env.FLEET_RIG_NODE1_SIGNING_FINGERPRINT ??
-    "SHA256:H5ez7DvuU+IhNEzHK8eELNf5520yO+ZWGn/TR8gEQmE",
+/**
+ * The two real machines. Each is addressed by the MagicDNS name its own
+ * `tailscale serve` terminates TLS for, so the master verifies a certificate
+ * rather than trusting the overlay alone. `ssh` here is provisioning only:
+ * enrolment has to run where the host key is.
+ */
+const NODES = {
+  node1: {
+    name: process.env.FLEET_RIG_NODE1_NAME ?? "claude-hetzner",
+    ssh: process.env.FLEET_RIG_NODE1_SSH ?? "claude@100.125.222.64",
+    host:
+      process.env.FLEET_RIG_NODE1_HOST ??
+      "https://claude-hetzner.tailae910a.ts.net:8443",
+    keyPath:
+      process.env.FLEET_RIG_NODE1_KEY_PATH ?? "/etc/ssh/ssh_host_ed25519_key",
+    sessionKeyPath:
+      process.env.FLEET_RIG_NODE1_SESSION_KEY_PATH ??
+      "~/.openhands/canvas-api-key",
+    stagingDir:
+      process.env.FLEET_RIG_NODE1_STAGING_DIR ??
+      "/home/claude/.cache/agent-canvas-enrol-rig",
+    // Pre-seeded: this machine's fingerprint is known to the operator, so it
+    // enrols straight to `active`.
+    preSeeded: true,
+    // Commit signing, checked before a run rather than after it. The
+    // fingerprint is the one published in the run's anchor comment.
+    signingKeyPath:
+      process.env.FLEET_RIG_NODE1_SIGNING_KEY_PATH ??
+      "/home/claude/.ssh/fleet-node-signing.pub",
+    signingKeyFingerprint:
+      process.env.FLEET_RIG_NODE1_SIGNING_FINGERPRINT ??
+      "SHA256:H5ez7DvuU+IhNEzHK8eELNf5520yO+ZWGn/TR8gEQmE",
+  },
+  node2: {
+    name: process.env.FLEET_RIG_NODE2_NAME ?? "claude-gcp-1",
+    ssh: process.env.FLEET_RIG_NODE2_SSH ?? "claude@100.66.160.98",
+    host:
+      process.env.FLEET_RIG_NODE2_HOST ??
+      "https://claude-gcp-1.tailae910a.ts.net:8443",
+    keyPath:
+      process.env.FLEET_RIG_NODE2_KEY_PATH ?? "/etc/ssh/ssh_host_ed25519_key",
+    sessionKeyPath:
+      process.env.FLEET_RIG_NODE2_SESSION_KEY_PATH ??
+      "~/.openhands/canvas-api-key",
+    stagingDir:
+      process.env.FLEET_RIG_NODE2_STAGING_DIR ??
+      "/home/claude/.cache/agent-canvas-enrol-rig",
+    // Deliberately not pre-seeded: this is the pending/TOFU path under test,
+    // and the approval that clears it is performed through the UI by
+    // Playwright, never by a human and never by curl.
+    preSeeded: false,
+  },
 };
-const NODE2_NAME = "local-node-2";
+
+/**
+ * The port `tailscale serve` publishes the master on, so a node can reach it
+ * by the Mac's own MagicDNS name. 8443 is the everyday canvas's and is off
+ * limits; this run creates 8444 and removes exactly that mapping on the way
+ * out.
+ */
+const MASTER_SERVE_PORT = Number(process.env.FLEET_RIG_MASTER_SERVE_PORT ?? 8444);
+
+/** Cluster settings for the k8s profile. */
+const K8S = {
+  // The VM that becomes a cluster, and is restored to a plain VM on teardown.
+  ssh: process.env.FLEET_RIG_K8S_SSH ?? "claude@100.66.160.98",
+  apiAddress: process.env.FLEET_RIG_K8S_API ?? "100.66.160.98",
+  namespace: process.env.FLEET_RIG_K8S_NAMESPACE ?? "fleet-rig",
+  canvasRelease: "fleet-canvas",
+  poolRelease: "fleet-pool",
+  image: process.env.FLEET_RIG_K8S_IMAGE ?? "agent-canvas:fleet-rig",
+  // Short enough that "the entry list changed within one poll" is an
+  // assertion a test can make without outliving its own timeout.
+  sourceIntervalMs: Number(process.env.FLEET_RIG_K8S_POLL_MS ?? 5000),
+};
+
 const AGENT_SERVER_VERSION = JSON.parse(
   readFileSync(path.join(REPO_ROOT, "config", "defaults.json"), "utf8"),
 ).versions.agentServer;
+
+/** Resolution for MagicDNS names, which this Mac's system resolver refuses. */
+const MAGICDNS_PRELOAD = path.join(
+  REPO_ROOT,
+  "tests/e2e/live/fleet-registry/magicdns.mjs",
+);
 
 // ───────────────────────────────────────────────────────────────────────────
 // Small helpers
@@ -96,28 +160,30 @@ function sh(command, args, options = {}) {
   return result.stdout.trim();
 }
 
-function ssh(remoteCommand, { timeout = 60_000 } = {}) {
+/**
+ * Runs a command on one of the real machines.
+ *
+ * Provisioning only: it stages the enrolment client where the host key lives,
+ * and installs k3s. No request the registry makes ever travels this way.
+ */
+function ssh(target, remoteCommand, { timeout = 60_000 } = {}) {
   return sh(
     "ssh",
-    [
-      "-o",
-      "BatchMode=yes",
-      "-o",
-      "ConnectTimeout=10",
-      NODE1.ssh,
-      remoteCommand,
-    ],
+    ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, remoteCommand],
     { timeout },
   );
 }
 
-/**
- * Copies the enrolment client onto node 1. The node runs a released
- * `agent-canvas` that predates this branch, so the code under test has to be
- * the code that runs there — otherwise the rig would prove the old client
- * works. Only the enrolment half is copied; nothing installed on the node is
- * touched.
- */
+/** Best-effort cleanup: a node that is already gone must not fail a teardown. */
+function trySsh(target, remoteCommand, options) {
+  try {
+    return ssh(target, remoteCommand, options);
+  } catch (error) {
+    log(`ssh ${target} failed (continuing): ${error.message.split("\n")[0]}`);
+    return null;
+  }
+}
+
 /**
  * The node still signs commits with its own key.
  *
@@ -131,37 +197,45 @@ function ssh(remoteCommand, { timeout = 60_000 } = {}) {
  */
 function checkNode1Signing() {
   if (process.env.FLEET_RIG_SKIP_SIGNING_CHECK) return;
+  const node = NODES.node1;
 
-  const format = ssh("git config --global --get gpg.format || true").trim();
+  const format = ssh(node.ssh, "git config --global --get gpg.format || true").trim();
   const fingerprint = ssh(
-    `ssh-keygen -lf ${NODE1.signingKeyPath} 2>/dev/null | cut -d' ' -f2 || true`,
+    node.ssh,
+    `ssh-keygen -lf ${node.signingKeyPath} 2>/dev/null | cut -d' ' -f2 || true`,
   ).trim();
   const signing = ssh(
+    node.ssh,
     "git config --global --get user.signingkey || true",
   ).trim();
 
   const problems = [];
   if (format !== "ssh") problems.push(`gpg.format is "${format}", not "ssh"`);
-  if (signing !== NODE1.signingKeyPath) {
-    problems.push(
-      `user.signingkey is "${signing}", not ${NODE1.signingKeyPath}`,
-    );
+  if (signing !== node.signingKeyPath) {
+    problems.push(`user.signingkey is "${signing}", not ${node.signingKeyPath}`);
   }
-  if (fingerprint !== NODE1.signingKeyFingerprint) {
+  if (fingerprint !== node.signingKeyFingerprint) {
     problems.push(
-      `${NODE1.signingKeyPath} is ${fingerprint || "unreadable"}, not the published ${NODE1.signingKeyFingerprint}`,
+      `${node.signingKeyPath} is ${fingerprint || "unreadable"}, not the published ${node.signingKeyFingerprint}`,
     );
   }
   if (problems.length > 0) {
     throw new Error(
-      `${NODE1.name}: commits from this node would not prove it made them: ` +
+      `${node.name}: commits from this node would not prove it made them: ` +
         `${problems.join("; ")}. Fix the node's signing config before the run.`,
     );
   }
-  log(`node1 signs with ${NODE1.signingKeyFingerprint}`);
+  log(`node1 signs with ${node.signingKeyFingerprint}`);
 }
 
-function stageNode1() {
+/**
+ * Copies the enrolment client onto a node. Each node runs a released
+ * `agent-canvas` that predates this branch, so the code under test has to be
+ * the code that runs there — otherwise the rig would prove the old client
+ * works. Only the enrolment half is copied; nothing installed on the node is
+ * touched, and teardown removes exactly this directory.
+ */
+function stageEnrolmentClient(node) {
   const files = [
     "bin/enrol.mjs",
     "scripts/registry/sign.mjs",
@@ -182,17 +256,17 @@ function stageNode1() {
     [
       "-o",
       "BatchMode=yes",
-      NODE1.ssh,
-      `rm -rf ${NODE1.stagingDir} && mkdir -p ${NODE1.stagingDir} && tar xzf - -C ${NODE1.stagingDir}`,
+      node.ssh,
+      `rm -rf ${node.stagingDir} && mkdir -p ${node.stagingDir} && tar xzf - -C ${node.stagingDir}`,
     ],
     { input: tar.stdout, encoding: "buffer" },
   );
   if (push.status !== 0) {
     throw new Error(
-      `could not stage the enrolment client on ${NODE1.name}: ${push.stderr}`,
+      `could not stage the enrolment client on ${node.name}: ${push.stderr}`,
     );
   }
-  log(`staged the enrolment client on ${NODE1.name}`);
+  log(`staged the enrolment client on ${node.name}`);
 }
 
 /** A free port in the rig's range, confirmed by binding it. */
@@ -308,8 +382,37 @@ async function stopService({ name, session, pid }) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// up
+// Shared state
 // ───────────────────────────────────────────────────────────────────────────
+
+function newState(profile) {
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[:.]/g, "")
+    .replace("T", "-")
+    .slice(0, 15);
+  const dir = path.join(tmpdir(), `fleet-rig-${timestamp}`);
+  const state = {
+    profile,
+    rigId: `fleet-rig-${timestamp}`,
+    dir,
+    home: path.join(dir, "home"),
+    startedAt: new Date().toISOString(),
+    services: [],
+    ports: {},
+    keys: {},
+    entries: {},
+  };
+  for (const sub of ["home", "logs", "evidence", "master"]) {
+    mkdirSync(path.join(dir, sub), { recursive: true });
+  }
+  mkdirSync(path.join(dir, "master", "home"), { recursive: true });
+  state.evidenceDir = path.join(dir, "evidence");
+  state.accessLogPath = path.join(state.evidenceDir, "proxy-access.jsonl");
+  state.tunnelMapPath = path.join(state.evidenceDir, "tunnel-map.json");
+  log(`profile ${profile}, rig dir ${dir}`);
+  return state;
+}
 
 function agentServerCommand(port) {
   const v = AGENT_SERVER_VERSION;
@@ -363,81 +466,54 @@ function baseEnv() {
   };
 }
 
-async function up() {
-  const timestamp = new Date()
-    .toISOString()
-    .replace(/[:.]/g, "")
-    .replace("T", "-")
-    .slice(0, 15);
-  const dir = path.join(tmpdir(), `fleet-rig-${timestamp}`);
-  const state = {
-    rigId: `fleet-rig-${timestamp}`,
-    dir,
-    home: path.join(dir, "home"),
-    startedAt: new Date().toISOString(),
-    services: [],
-    ports: {},
-    keys: {},
-    entries: {},
-  };
-  for (const sub of ["home", "logs", "evidence", "master", "node2"]) {
-    mkdirSync(path.join(dir, sub), { recursive: true });
-  }
-  mkdirSync(path.join(dir, "master", "home"), { recursive: true });
-  mkdirSync(path.join(dir, "node2", "home"), { recursive: true });
-  log(`rig dir ${dir}`);
+// ───────────────────────────────────────────────────────────────────────────
+// Profile tailnet: two real VMs on a private overlay
+// ───────────────────────────────────────────────────────────────────────────
+
+async function upTailnet() {
+  const state = newState("tailnet");
 
   const taken = new Set();
   state.ports = {
     masterAgentServer: await freePort(taken),
-    node2AgentServer: await freePort(taken),
     static: await freePort(taken),
     ingress: await freePort(taken),
-    node1Tunnel: await freePort(taken),
   };
   state.keys = {
-    // Three distinct keys. Criterion 2 asserts no *node* key reaches the
-    // browser; the master key legitimately does, so they must never collide.
+    // Three distinct keys. The browser assertions say no *node* key reaches
+    // it; the master key legitimately does, so they must never collide.
     master: `master-${randomBytes(24).toString("hex")}`,
-    node2: `node2-${randomBytes(24).toString("hex")}`,
-    node1: ssh(`cat ${NODE1.sessionKeyPath}`),
+    node1: ssh(NODES.node1.ssh, `cat ${NODES.node1.sessionKeyPath}`),
+    node2: ssh(NODES.node2.ssh, `cat ${NODES.node2.sessionKeyPath}`),
   };
-  if (!state.keys.node1 || state.keys.node1.length < 8) {
-    throw new Error(
-      `${NODE1.name}: session key at ${NODE1.sessionKeyPath} is unusable`,
-    );
+  for (const which of ["node1", "node2"]) {
+    if (!state.keys[which] || state.keys[which].length < 8) {
+      throw new Error(
+        `${NODES[which].name}: session key at ${NODES[which].sessionKeyPath} is unusable`,
+      );
+    }
   }
   log(`ports ${JSON.stringify(state.ports)}`);
 
   checkNode1Signing();
 
-  state.evidenceDir = path.join(dir, "evidence");
-  state.accessLogPath = path.join(state.evidenceDir, "proxy-access.jsonl");
-  state.tunnelMapPath = path.join(state.evidenceDir, "tunnel-map.json");
-
-  stageNode1();
-  state.node1Fingerprint = ssh(
-    `sudo -n node ${NODE1.stagingDir}/bin/enrol.mjs --print-fingerprint --key ${NODE1.keyPath}`,
-  );
-  log(`${NODE1.name} fingerprint ${state.node1Fingerprint}`);
+  for (const which of ["node1", "node2"]) {
+    const node = NODES[which];
+    stageEnrolmentClient(node);
+    state[`${which}Fingerprint`] = ssh(
+      node.ssh,
+      `sudo -n node ${node.stagingDir}/bin/enrol.mjs --print-fingerprint --key ${node.keyPath}`,
+    );
+    state[`${which}Url`] = node.host;
+    log(`${node.name} fingerprint ${state[`${which}Fingerprint`]}`);
+  }
 
   // ── processes ────────────────────────────────────────────────────────────
   startService(state, {
     name: "master-agent-server",
     command: agentServerCommand(state.ports.masterAgentServer),
-    env: agentServerEnv(path.join(dir, "master"), state.keys.master),
-    cwd: path.join(dir, "master"),
-  });
-  startService(state, {
-    name: "node2-agent-server",
-    command: agentServerCommand(state.ports.node2AgentServer),
-    env: agentServerEnv(path.join(dir, "node2"), state.keys.node2),
-    cwd: path.join(dir, "node2"),
-  });
-  startService(state, {
-    name: "node1-tunnel",
-    command: `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -L 127.0.0.1:${state.ports.node1Tunnel}:127.0.0.1:${NODE1.port} ${NODE1.ssh}`,
-    env: { ...baseEnv(), HOME: process.env.HOME ?? "" },
+    env: agentServerEnv(path.join(state.dir, "master"), state.keys.master),
+    cwd: path.join(state.dir, "master"),
   });
   startService(state, {
     name: "static",
@@ -453,7 +529,10 @@ async function up() {
   startService(state, {
     name: "ingress",
     command: [
-      "node scripts/ingress.mjs",
+      // The master binds loopback: `tailscale serve` below is what publishes
+      // it, and it is the only thing that should be able to.
+      `node --import ${shellQuote(MAGICDNS_PRELOAD)} scripts/ingress.mjs`,
+      "--host 127.0.0.1",
       `--port ${state.ports.ingress}`,
       ...[
         "/api",
@@ -468,6 +547,7 @@ async function up() {
       ].map((prefix) => `--route ${prefix}=${agentServer}`),
       `--default http://127.0.0.1:${state.ports.static}`,
       `--registry-session-key ${shellQuote(state.keys.master)}`,
+      // Only node 1. Node 2's absence here is the pending/TOFU path under test.
       `--registry-preseed ${shellQuote(state.node1Fingerprint)}`,
       "--registry-secret-provider file",
       // The wire record every hop to a fleet node is verified against. It
@@ -484,24 +564,36 @@ async function up() {
 
   const base = `http://127.0.0.1:${state.ports.ingress}`;
   state.baseUrl = base;
-  state.node2Url = `http://127.0.0.1:${state.ports.node2AgentServer}`;
-  state.node1Url = `http://127.0.0.1:${state.ports.node1Tunnel}`;
 
-  // The proxy records the host it dialled, which is a loopback port on this
-  // Mac. On its own that says nothing about which machine answered, so the
-  // forward behind it is written down alongside and the chain verifier
-  // refuses to pass a proxy line it cannot resolve through this map.
+  // The nodes reach the master by this Mac's own MagicDNS name. 8443 is the
+  // everyday canvas's mapping and is never touched; this creates 8444 and
+  // teardown removes exactly it.
+  state.masterServeUrl = `https://${macTailnetName()}:${MASTER_SERVE_PORT}`;
+  sh("tailscale", [
+    "serve",
+    "--bg",
+    "--https",
+    String(MASTER_SERVE_PORT),
+    `http://127.0.0.1:${state.ports.ingress}`,
+  ]);
+  state.masterServePort = MASTER_SERVE_PORT;
+  log(`master published at ${state.masterServeUrl}`);
+
+  // With a ts.net entry host the tunnel map does not disappear; it stops
+  // being "this loopback port forwards to that machine" and becomes a
+  // one-line attestation that this name is that machine.
   writeFileSync(
     state.tunnelMapPath,
     JSON.stringify(
-      {
-        [state.node1Url]: {
-          node: NODE1.name,
-          ssh: NODE1.ssh,
-          remote: `127.0.0.1:${NODE1.port}`,
-          fingerprint: state.node1Fingerprint,
-        },
-      },
+      Object.fromEntries(
+        ["node1", "node2"].map((which) => [
+          NODES[which].host,
+          {
+            node: NODES[which].name,
+            fingerprint: state[`${which}Fingerprint`],
+          },
+        ]),
+      ),
       null,
       2,
     ),
@@ -513,18 +605,17 @@ async function up() {
     async () => (await httpStatus(`${agentServer}/server_info`)) === 200,
   );
   await waitFor(
-    "node 2 agent server",
-    async () => (await httpStatus(`${state.node2Url}/server_info`)) === 200,
-  );
-  await waitFor(
-    `${NODE1.name} through the tunnel`,
-    async () => (await httpStatus(`${state.node1Url}/server_info`)) === 200,
-  );
-  await waitFor(
     "ingress",
     async () => (await httpStatus(`${base}/server_info`)) === 200,
   );
   await waitFor("canvas", async () => (await httpStatus(`${base}/`)) === 200);
+  for (const which of ["node1", "node2"]) {
+    await waitFor(
+      `${NODES[which].name} on its published address`,
+      async () =>
+        (await httpStatus(`${NODES[which].host}/server_info`)) === 200,
+    );
+  }
 
   writeState(state);
   await enrolBothNodes(state);
@@ -535,8 +626,15 @@ async function up() {
   return state;
 }
 
+/** This Mac's MagicDNS name, which both nodes must be able to reach. */
+function macTailnetName() {
+  if (process.env.FLEET_RIG_MASTER_NAME) return process.env.FLEET_RIG_MASTER_NAME;
+  const dnsName = JSON.parse(sh("tailscale", ["status", "--json"])).Self.DNSName;
+  return dnsName.replace(/\.$/, "");
+}
+
 // ───────────────────────────────────────────────────────────────────────────
-// Enrolment
+// Enrolment (tailnet profile only: k8s discovers, it does not enrol)
 // ───────────────────────────────────────────────────────────────────────────
 
 async function registryEntries(state) {
@@ -550,67 +648,37 @@ async function registryEntries(state) {
 }
 
 /**
- * Node 1 enrols from node 1, over the tailnet, signing with its real SSH host
- * key and publishing only a credential *reference*: the `file` provider is
- * master-local, so the key itself is placed into the master's provider out of
- * band rather than travelling with the registration.
+ * Enrols one node, from that node.
+ *
+ * Only the machine holding the host key can sign for itself, which is why
+ * this runs there rather than here. It publishes a credential *reference*:
+ * the `file` provider is master-local, so the key itself is placed into the
+ * master's provider out of band rather than travelling with the registration.
  */
-async function enrolNode1(state) {
-  const masterUrl = `http://${tailnetAddress()}:${state.ports.ingress}`;
+async function enrolNode(state, which) {
+  const node = NODES[which];
   // The registry derives the reference it stores from the fingerprint and
   // ignores whatever the registration asks for, so the out-of-band placement
   // below has to use the derived one too.
-  const credRef = credRefFor(state.node1Fingerprint);
-  const version = await remoteAgentServerVersion(state);
+  const credRef = credRefFor(state[`${which}Fingerprint`]);
+  const version = await remoteAgentServerVersion(node.host);
   const output = ssh(
+    node.ssh,
     [
-      `sudo -n node ${NODE1.stagingDir}/bin/enrol.mjs`,
-      `--registry ${shellQuote(masterUrl)}`,
-      `--name ${shellQuote(NODE1.name)}`,
-      `--host ${shellQuote(state.node1Url)}`,
+      `sudo -n node ${node.stagingDir}/bin/enrol.mjs`,
+      `--registry ${shellQuote(state.masterServeUrl)}`,
+      `--name ${shellQuote(node.name)}`,
+      `--host ${shellQuote(node.host)}`,
       "--has-credential",
-      `--key ${NODE1.keyPath}`,
+      `--key ${node.keyPath}`,
       `--version ${shellQuote(version)}`,
     ].join(" "),
   );
-  log(`${NODE1.name} enrol -> ${enrolResultLine(output)}`);
+  log(`${node.name} enrol -> ${enrolResultLine(output)}`);
 
   // Out-of-band credential placement: the provisioner's job in a real
   // deployment, and the reason the registration carries a reference only.
-  writeSecret(state, credRef, state.keys.node1);
-  return output;
-}
-
-/**
- * Node 2 has no SSH host key this process may read, so it enrols with a
- * generated one — the `--generate-key` path — and publishes its key through
- * the master's own `file` provider, which is the supported same-host case.
- */
-function enrolNode2(state) {
-  const output = sh(
-    "node",
-    [
-      "bin/enrol.mjs",
-      "--registry",
-      state.baseUrl,
-      "--name",
-      NODE2_NAME,
-      "--host",
-      state.node2Url,
-      "--secret-provider",
-      "file",
-      "--secret",
-      state.keys.node2,
-      "--generate-key",
-      "--version",
-      AGENT_SERVER_VERSION,
-    ],
-    {
-      cwd: REPO_ROOT,
-      env: { ...process.env, HOME: state.home },
-    },
-  );
-  log(`${NODE2_NAME} enrol -> ${enrolResultLine(output)}`);
+  writeSecret(state, credRef, state.keys[which]);
   return output;
 }
 
@@ -638,37 +706,240 @@ function writeSecret(state, ref, secret) {
 }
 
 async function enrolBothNodes(state) {
-  await enrolNode1(state);
-  enrolNode2(state);
+  await enrolNode(state, "node1");
+  await enrolNode(state, "node2");
 
   const entries = await registryEntries(state);
-  for (const entry of entries) {
-    if (entry.name === NODE1.name) state.entries.node1 = entry;
-    if (entry.name === NODE2_NAME) state.entries.node2 = entry;
+  for (const which of ["node1", "node2"]) {
+    const entry = entries.find((each) => each.name === NODES[which].name);
+    if (!entry) {
+      throw new Error(
+        `expected ${NODES[which].name} in the registry, got ${entries.map((e) => e.name).join(", ") || "nothing"}`,
+      );
+    }
+    state.entries[which] = entry;
   }
-  if (!state.entries.node1 || !state.entries.node2) {
-    throw new Error(
-      `expected both nodes in the registry, got ${entries.map((e) => e.name).join(", ") || "nothing"}`,
-    );
-  }
-  state.node2Fingerprint = state.entries.node2.fingerprint;
 }
 
-/** The version node 1 actually reports, so the entry never claims a guess. */
-async function remoteAgentServerVersion(state) {
-  const response = await fetch(`${state.node1Url}/server_info`);
+/** The version a node actually reports, so the entry never claims a guess. */
+async function remoteAgentServerVersion(host) {
+  const response = await fetch(`${host}/server_info`);
   if (!response.ok) {
-    throw new Error(`${NODE1.name} /server_info returned ${response.status}`);
+    throw new Error(`${host} /server_info returned ${response.status}`);
   }
   return (await response.json()).version ?? "unknown";
 }
 
-/** This machine's tailnet address, which node 1 must be able to reach. */
-function tailnetAddress() {
-  if (process.env.FLEET_RIG_MASTER_ADDRESS) {
-    return process.env.FLEET_RIG_MASTER_ADDRESS;
+// ───────────────────────────────────────────────────────────────────────────
+// Profile k8s: one real cluster, built from nothing
+// ───────────────────────────────────────────────────────────────────────────
+
+function kubectl(state, args, options = {}) {
+  return sh("kubectl", ["--kubeconfig", state.kubeconfig, ...args], options);
+}
+
+function helm(state, args) {
+  return sh("helm", ["--kubeconfig", state.kubeconfig, ...args], {
+    cwd: REPO_ROOT,
+    timeout: 600_000,
+  });
+}
+
+/**
+ * Turns the plain VM into a single-node k3s cluster and hands back a
+ * kubeconfig that works from here.
+ *
+ * `--tls-san` is what makes the API server's certificate valid for the
+ * address this machine dials; without it every kubectl call fails
+ * verification and the honest fix would be `--insecure-skip-tls-verify`,
+ * which is not a thing this rig will do.
+ */
+function installK3s(state) {
+  log("installing k3s on the VM (from nothing)");
+  ssh(
+    K8S.ssh,
+    `curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--tls-san ${K8S.apiAddress} --write-kubeconfig-mode 644" sudo -n sh -`,
+    { timeout: 600_000 },
+  );
+  ssh(
+    K8S.ssh,
+    "sudo -n k3s kubectl wait --for=condition=Ready node --all --timeout=180s",
+    { timeout: 240_000 },
+  );
+
+  const raw = ssh(K8S.ssh, "sudo -n cat /etc/rancher/k3s/k3s.yaml");
+  const kubeconfig = raw.replace(
+    /server: https:\/\/127\.0\.0\.1:6443/,
+    `server: https://${K8S.apiAddress}:6443`,
+  );
+  state.kubeconfig = path.join(state.dir, "kubeconfig.yaml");
+  writeFileSync(state.kubeconfig, `${kubeconfig}\n`, { mode: 0o600 });
+  log(`kubeconfig written to ${state.kubeconfig}`);
+}
+
+/**
+ * Puts this branch's image into the cluster's own image store.
+ *
+ * The released image has no registry in it at all — the chart's
+ * `registry.enabled` switch was wired to environment variables nothing read.
+ * So the cluster has to run the image built from this tree, and with no
+ * registry to push to, `docker save` piped into containerd is the honest way
+ * to get it there.
+ */
+function importImage(state) {
+  const [repository, tag] = K8S.image.split(":");
+  const present = spawnSync("docker", ["image", "inspect", K8S.image], {
+    stdio: "ignore",
+  });
+  if (present.status !== 0) {
+    throw new Error(
+      `${K8S.image} is not built. Run: node scripts/docker-build.mjs --tag ${K8S.image}`,
+    );
   }
-  return sh("tailscale", ["ip", "-4"]).split("\n")[0].trim();
+  log(`importing ${K8S.image} into the cluster (this takes a few minutes)`);
+  const save = spawnSync(
+    "bash",
+    [
+      "-o",
+      "pipefail",
+      "-c",
+      `docker save ${shellQuote(K8S.image)} | ssh -o BatchMode=yes ${K8S.ssh} 'sudo -n k3s ctr images import -'`,
+    ],
+    { encoding: "utf8", timeout: 1_800_000 },
+  );
+  if (save.status !== 0) {
+    throw new Error(
+      `could not import ${K8S.image} into the cluster: ${(save.stderr || save.stdout || "").trim()}`,
+    );
+  }
+  log(`imported ${repository}:${tag}`);
+}
+
+async function upK8s() {
+  const state = newState("k8s");
+  state.keys = { master: `master-${randomBytes(24).toString("hex")}` };
+  state.namespace = K8S.namespace;
+  state.releases = { canvas: K8S.canvasRelease, pool: K8S.poolRelease };
+  state.sourceIntervalMs = K8S.sourceIntervalMs;
+
+  installK3s(state);
+  importImage(state);
+
+  kubectl(state, ["create", "namespace", state.namespace]);
+  kubectl(state, [
+    "-n",
+    state.namespace,
+    "create",
+    "secret",
+    "generic",
+    "fleet-session-key",
+    `--from-literal=session-api-key=${state.keys.master}`,
+  ]);
+
+  // The agent pool. Its Service carries the label the registry discovers by,
+  // and nothing about it is enrolled, keyed or pre-seeded: membership of the
+  // namespace is the membership of the fleet.
+  log("helm install: agent pool");
+  helm(state, [
+    "install",
+    state.releases.pool,
+    "helm/agent-canvas",
+    "-n",
+    state.namespace,
+    "--set",
+    "agentPool.enabled=true",
+    "--set",
+    "agentPool.replicas=2",
+    "--set",
+    `image.repository=${K8S.image.split(":")[0]}`,
+    "--set",
+    `image.tag=${K8S.image.split(":")[1]}`,
+    "--set",
+    "image.pullPolicy=Never",
+    "--set",
+    "persistence.enabled=false",
+    "--wait",
+    "--timeout",
+    "10m",
+  ]);
+
+  // The canvas. Same chart, same image; what differs is that this one runs
+  // the registry and polls the API server for the pool's Services.
+  log("helm install: canvas with the kubernetes source");
+  helm(state, [
+    "install",
+    state.releases.canvas,
+    "helm/agent-canvas",
+    "-n",
+    state.namespace,
+    "--set",
+    `image.repository=${K8S.image.split(":")[0]}`,
+    "--set",
+    `image.tag=${K8S.image.split(":")[1]}`,
+    "--set",
+    "image.pullPolicy=Never",
+    "--set",
+    "persistence.enabled=false",
+    "--set",
+    "registry.enabled=true",
+    "--set",
+    "registry.sources.kubernetes.enabled=true",
+    // Discovered entries carry no credential reference, because this profile
+    // distributes no keys at all. `/server_info` needs none either, which is
+    // what the proof rests on.
+    "--set",
+    "registry.allowUncredentialed=true",
+    "--set",
+    `registry.sourceIntervalSeconds=${Math.round(K8S.sourceIntervalMs / 1000)}`,
+    "--set",
+    "secrets.sessionApiKey.existingSecret=fleet-session-key",
+    "--set",
+    "secrets.sessionApiKey.key=session-api-key",
+    "--wait",
+    "--timeout",
+    "10m",
+  ]);
+
+  state.canvasService = `${state.releases.canvas}-agent-canvas`;
+  state.poolService = `${state.releases.pool}-agent-canvas`;
+
+  // The viewer's path into the cluster. Not the overlay: this profile exists
+  // to prove no overlay is needed, so the canvas is reached exactly the way a
+  // platform engineer reaches any in-cluster service.
+  const taken = new Set();
+  state.ports = { portForward: await freePort(taken) };
+  startService(state, {
+    name: "port-forward",
+    command: `kubectl --kubeconfig ${shellQuote(state.kubeconfig)} -n ${state.namespace} port-forward svc/${state.canvasService} ${state.ports.portForward}:80`,
+    env: baseEnv(),
+  });
+  state.baseUrl = `http://127.0.0.1:${state.ports.portForward}`;
+
+  await waitFor(
+    "the canvas through the port-forward",
+    async () => (await httpStatus(`${state.baseUrl}/server_info`)) === 200,
+    { timeoutMs: 180_000 },
+  );
+  await waitFor(
+    "the pool's Services to be discovered",
+    async () => (await registryEntries(state)).length >= 2,
+    { timeoutMs: 180_000 },
+  );
+
+  const entries = await registryEntries(state);
+  state.entries = {
+    node1: entries[0],
+    node2: entries[1],
+  };
+  state.node1Fingerprint = entries[0].fingerprint;
+  state.node2Fingerprint = entries[1].fingerprint;
+  state.node1Url = entries[0].host;
+  state.node2Url = entries[1].host;
+
+  writeState(state);
+  log("rig is up");
+  log(JSON.stringify(summary(state), null, 2));
+  return state;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -677,21 +948,24 @@ function tailnetAddress() {
 
 function summary(state) {
   return {
+    profile: state.profile,
     rigId: state.rigId,
     dir: state.dir,
     baseUrl: state.baseUrl,
+    masterServeUrl: state.masterServeUrl ?? null,
     ports: state.ports,
     evidenceDir: state.evidenceDir,
     accessLogPath: state.accessLogPath,
     tunnelMapPath: state.tunnelMapPath,
+    namespace: state.namespace ?? null,
     node1: {
-      name: NODE1.name,
+      name: state.entries.node1?.name ?? NODES.node1.name,
       url: state.node1Url,
       fingerprint: state.node1Fingerprint,
       entry: state.entries.node1 ?? null,
     },
     node2: {
-      name: NODE2_NAME,
+      name: state.entries.node2?.name ?? NODES.node2.name,
       url: state.node2Url,
       fingerprint: state.node2Fingerprint ?? null,
       entry: state.entries.node2 ?? null,
@@ -703,9 +977,7 @@ function writeState(state) {
   writeFileSync(
     path.join(state.dir, "state.json"),
     JSON.stringify(state, null, 2),
-    {
-      mode: 0o600,
-    },
+    { mode: 0o600 },
   );
   mkdirSync(path.dirname(POINTER_PATH), { recursive: true });
   writeFileSync(POINTER_PATH, JSON.stringify(state, null, 2), { mode: 0o600 });
@@ -721,8 +993,9 @@ export function readRigState(pointerPath = POINTER_PATH) {
 
 /**
  * Teardown, in the order the contract needs: clear server-side state while the
- * master is still answering, then stop recorded PIDs, then remove the rig's
- * secrets. Best-effort on each step so a half-failed rig still tears down.
+ * master is still answering, then stop recorded PIDs, then remove what the run
+ * created. Best-effort on each step so a half-failed rig still tears down, and
+ * nothing the run did not create is ever touched.
  */
 async function down() {
   let state;
@@ -733,11 +1006,38 @@ async function down() {
     return;
   }
 
+  if (state.profile === "k8s") {
+    await downK8s(state);
+  } else {
+    await downTailnet(state);
+  }
+
+  rmSync(POINTER_PATH, { force: true });
+  log(`rig down; artefacts remain at ${state.dir}`);
+}
+
+async function downTailnet(state) {
   try {
     await clearFleetBackends(state);
     log("cleared fleet_backends on the master agent server");
   } catch (error) {
     log(`could not clear fleet_backends: ${error.message}`);
+  }
+
+  if (state.masterServePort) {
+    try {
+      // Exactly the mapping this run created. Every other serve mapping on
+      // this machine, including the everyday canvas's :8443, is left alone.
+      sh("tailscale", [
+        "serve",
+        "--https",
+        String(state.masterServePort),
+        "off",
+      ]);
+      log(`removed the serve mapping on :${state.masterServePort}`);
+    } catch (error) {
+      log(`could not remove the serve mapping: ${error.message}`);
+    }
   }
 
   for (const service of [...state.services].reverse()) {
@@ -758,15 +1058,53 @@ async function down() {
     log(`could not remove the secret store: ${error.message}`);
   }
 
-  try {
-    ssh(`rm -rf ${NODE1.stagingDir}`);
-    log(`removed ${NODE1.stagingDir} on ${NODE1.name}`);
-  } catch (error) {
-    log(`could not clean ${NODE1.name}: ${error.message}`);
+  for (const which of ["node1", "node2"]) {
+    const node = NODES[which];
+    if (trySsh(node.ssh, `rm -rf ${node.stagingDir}`) !== null) {
+      log(`removed ${node.stagingDir} on ${node.name}`);
+    }
+  }
+}
+
+/**
+ * Restores the VM to a plain VM.
+ *
+ * Install-from-nothing is part of the enterprise claim, so every run pays for
+ * it: the helm releases this run created are removed by name, then k3s itself
+ * is uninstalled. A release the run did not create is never named here.
+ */
+async function downK8s(state) {
+  for (const service of [...state.services].reverse()) {
+    try {
+      await stopService(service);
+    } catch (error) {
+      log(`could not stop ${service.name}: ${error.message}`);
+    }
   }
 
-  rmSync(POINTER_PATH, { force: true });
-  log(`rig down; artefacts remain at ${state.dir}`);
+  for (const release of [state.releases?.canvas, state.releases?.pool]) {
+    if (!release) continue;
+    try {
+      helm(state, ["uninstall", release, "-n", state.namespace, "--wait"]);
+      log(`uninstalled ${release}`);
+    } catch (error) {
+      log(`could not uninstall ${release}: ${error.message.split("\n")[0]}`);
+    }
+  }
+  try {
+    kubectl(state, ["delete", "namespace", state.namespace, "--wait=false"]);
+  } catch (error) {
+    log(`could not delete the namespace: ${error.message.split("\n")[0]}`);
+  }
+
+  if (process.env.FLEET_RIG_KEEP_CLUSTER) {
+    log("FLEET_RIG_KEEP_CLUSTER is set; leaving k3s installed");
+    return;
+  }
+  trySsh(K8S.ssh, "sudo -n /usr/local/bin/k3s-uninstall.sh", {
+    timeout: 300_000,
+  });
+  log("k3s uninstalled; the VM is a plain VM again");
 }
 
 async function clearFleetBackends(state) {
@@ -790,17 +1128,39 @@ async function clearFleetBackends(state) {
 // Entry point
 // ───────────────────────────────────────────────────────────────────────────
 
+const PROFILES = { tailnet: upTailnet, k8s: upK8s };
+
+function requestedProfile() {
+  const flag = process.argv.indexOf("--profile");
+  const value =
+    (flag !== -1 ? process.argv[flag + 1] : null) ??
+    process.env.PROFILE ??
+    "tailnet";
+  if (!(value in PROFILES)) {
+    throw new Error(
+      `unknown profile "${value}"; expected one of ${Object.keys(PROFILES).join(", ")}`,
+    );
+  }
+  return value;
+}
+
 const COMMANDS = {
-  up,
+  async up() {
+    await PROFILES[requestedProfile()]();
+  },
   down,
   /**
-   * Re-runs node 1's enrolment. Only that machine holds its host key, so a
+   * Re-runs a node's enrolment. Only that machine holds its host key, so a
    * re-registration has to originate there; the spec shells out to this
    * rather than growing its own SSH knowledge.
    */
   async "reenrol-node1"() {
     const state = readRigState();
-    console.log(await enrolNode1(state));
+    console.log(await enrolNode(state, "node1"));
+  },
+  async "reenrol-node2"() {
+    const state = readRigState();
+    console.log(await enrolNode(state, "node2"));
   },
   async status() {
     const state = readRigState();
@@ -826,7 +1186,9 @@ const isMainModule =
 if (isMainModule) {
   const command = COMMANDS[process.argv[2] ?? "status"];
   if (!command) {
-    console.error(`usage: rig.mjs <${Object.keys(COMMANDS).join("|")}>`);
+    console.error(
+      `usage: rig.mjs <${Object.keys(COMMANDS).join("|")}> [--profile tailnet|k8s]`,
+    );
     process.exit(2);
   }
   command().catch((error) => {
