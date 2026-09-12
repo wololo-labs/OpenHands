@@ -131,6 +131,24 @@ export function checkTrailers(commit, { runNonce }) {
 }
 
 /**
+ * A proxy line the node itself answered.
+ *
+ * `proxied:<status>` is written once the response completed, so the status is
+ * the node's own: 101 for an accepted socket, 2xx/3xx for a served request.
+ * A 4xx or 5xx is the node refusing, which is evidence the work did NOT
+ * happen there. A bare `proxied` comes from a log written before the status
+ * was recorded at all and cannot tell the two apart, so it does not count
+ * either -- logs from before that change verify as broken rather than as
+ * proof, which is the safe direction.
+ */
+export function answeredByNode(entry) {
+  const match = /^proxied:(\d{3})$/.exec(String(entry?.outcome ?? ""));
+  if (!match) return false;
+  const status = Number(match[1]);
+  return status === 101 || (status >= 200 && status < 400);
+}
+
+/**
  * The loopback host in a proxy line, resolved through the SSH forward the rig
  * opened, reaches the node's own fingerprint.
  *
@@ -179,13 +197,16 @@ export function checkProxy(
 
   // "Through the injecting proxy" is part of the claim, so a line the proxy
   // refused, or served without resolving a credential, does not support it.
+  // Neither does one the node answered with an error: `/x/conversations/<any
+  // id>` reaches the proxy from anyone holding the master key, and the node
+  // 404s it, which is a line naming a conversation that never existed.
   const proxied = forConversation.filter(
-    (entry) => entry.outcome === "proxied" && entry.credential === "injected",
+    (entry) => answeredByNode(entry) && entry.credential === "injected",
   );
   if (proxied.length === 0) {
     return {
       ok: false,
-      reason: `${conversationId} reached the proxy but was never proxied with a credential`,
+      reason: `${conversationId} reached the proxy but was never answered by the node with a credential`,
     };
   }
 

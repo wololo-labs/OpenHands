@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  answeredByNode,
   checkEvents,
   checkProxy,
   checkTrailers,
@@ -42,7 +43,7 @@ function proxyLine(overrides: Record<string, unknown> = {}) {
     entryFingerprint: FINGERPRINT,
     entryHost: LOCAL,
     credential: "injected",
-    outcome: "proxied",
+    outcome: "proxied:200",
     error: null,
     ...overrides,
   };
@@ -166,8 +167,35 @@ describe("checkProxy", () => {
     ]) {
       const result = checkProxy([line], base);
       expect(result.ok).toBe(false);
-      expect(result.reason).toContain("never proxied with a credential");
+      expect(result.reason).toContain("never answered by the node");
     }
+  });
+
+  /**
+   * The hole this closes: anyone holding the master key can address
+   * `/backend/<node>/api/conversations/<invented id>` at a real node. The
+   * request is proxied, a credential IS injected, and the node 404s it. Taken
+   * as proof, that mints link 3 for a conversation in which nothing ever ran.
+   */
+  it("fails on a line the node answered with an error", () => {
+    for (const outcome of ["proxied:404", "proxied:401", "proxied:502"]) {
+      const result = checkProxy([proxyLine({ outcome })], base);
+      expect(result.ok).toBe(false);
+      expect(result.reason).toContain("never answered by the node");
+    }
+  });
+
+  it("fails on a log written before the node's status was recorded", () => {
+    // A bare `proxied` cannot tell a served request from a refused one, so it
+    // verifies as broken rather than as proof.
+    const result = checkProxy([proxyLine({ outcome: "proxied" })], base);
+    expect(result.ok).toBe(false);
+  });
+
+  it("passes on an accepted event socket", () => {
+    expect(checkProxy([proxyLine({ outcome: "proxied:101" })], base).ok).toBe(
+      true,
+    );
   });
 
   it("fails when the proxied entry is not the node's fingerprint", () => {
@@ -526,5 +554,27 @@ describe("createSignatureVerifier (real git, real keys)", () => {
       events: { ok: true },
     });
     expect(result.ok).toBe(true);
+  });
+});
+
+describe("answeredByNode", () => {
+  it.each(["proxied:101", "proxied:200", "proxied:302"])(
+    "counts %s as the node answering",
+    (outcome) => {
+      expect(answeredByNode({ outcome })).toBe(true);
+    },
+  );
+
+  it.each([
+    "proxied",
+    "proxied:401",
+    "proxied:404",
+    "proxied:500",
+    "refused:403",
+    "aborted:200",
+    "upstream_error",
+    undefined,
+  ])("does not count %s", (outcome) => {
+    expect(answeredByNode({ outcome })).toBe(false);
   });
 });
