@@ -365,6 +365,112 @@ describe("ingress.mjs CLI", () => {
   });
 });
 
+describe("ingress malformed request lines", () => {
+  let ingressProcess: ChildProcess | undefined;
+  let upstream: Server | undefined;
+  let stderr: string;
+
+  afterEach(async () => {
+    await stopChild(ingressProcess);
+    ingressProcess = undefined;
+    await closeServer(upstream);
+    upstream = undefined;
+  });
+
+  /**
+   * Writes a raw request line Node's HTTP parser accepts and the WHATWG URL
+   * parser rejects. `fetch` cannot send this: it would normalise or refuse the
+   * URL, so the socket is written by hand.
+   */
+  async function sendRawRequest(port: number, requestLine: string) {
+    await new Promise<void>((resolve) => {
+      const socket = netConnect({ host: loopbackHost, port }, () => {
+        socket.write(
+          `${requestLine} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`,
+        );
+      });
+      socket.on("error", () => resolve());
+      socket.on("close", () => resolve());
+      socket.setTimeout(2000, () => {
+        socket.destroy();
+        resolve();
+      });
+    });
+    await delay(150);
+  }
+
+  async function startIngress(extraArgs: string[]) {
+    upstream = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const upstreamPort = await listenOnLoopback(upstream);
+    const port = await getFreePort();
+    stderr = "";
+    ingressProcess = spawn(
+      process.execPath,
+      [
+        ingressScript,
+        "--port",
+        port.toString(),
+        "--default",
+        originForPort(upstreamPort),
+        ...extraArgs,
+      ],
+      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    ingressProcess.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    await waitForPort(port, ingressProcess);
+    return port;
+  }
+
+  /**
+   * The registry check runs in the request listener before any authentication,
+   * so an unparseable request line reaching a bare `new URL` there is an
+   * unauthenticated remote kill of the master and everything it is proxying
+   * for. One `GET //[` was enough.
+   */
+  it("survives GET //[ with the registry mounted", async () => {
+    const port = await startIngress([
+      "--registry-session-key",
+      "test-key",
+      "--registry-agent-server",
+      "http://127.0.0.1:1",
+    ]);
+
+    await sendRawRequest(port, "GET //[");
+
+    expect(
+      ingressProcess?.exitCode,
+      "the ingress died on an unauthenticated malformed request line",
+    ).toBeNull();
+    expect(stderr).not.toMatch(/ERR_INVALID_URL/);
+    expect((await getJson(`${originForPort(port)}/anything`)).status).toBe(200);
+  });
+
+  /**
+   * The /server_info interception parses the same way, one branch later, and
+   * only when --runtime-services-info is set. Guarding the registry alone left
+   * this one live.
+   */
+  it("survives GET //[ with /server_info interception on", async () => {
+    const port = await startIngress([
+      "--runtime-services-info",
+      JSON.stringify({ vscode: { url: "http://127.0.0.1:1" } }),
+    ]);
+
+    await sendRawRequest(port, "GET //[");
+
+    expect(
+      ingressProcess?.exitCode,
+      "the ingress died parsing a malformed request line for /server_info",
+    ).toBeNull();
+    expect((await getJson(`${originForPort(port)}/anything`)).status).toBe(200);
+  });
+});
+
 describe("ingress proxy functionality", () => {
   let backend1: Server;
   let backend2: Server;
