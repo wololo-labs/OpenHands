@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { Agent } from "undici";
+
 import {
+  createClusterDispatcher,
   listAgentServerServices,
   readInClusterConfig,
   serviceFingerprint,
@@ -86,10 +89,13 @@ function stubFetch(
   return { fetchImpl, calls };
 }
 
+const CLUSTER_CA = "-----BEGIN CERTIFICATE-----\nnot-a-real-ca\n-----END CERTIFICATE-----";
+
 const K8S_CONFIG = {
   apiServer: "https://10.0.0.1:443",
   token: "sa-token",
   namespace: "agents",
+  ca: CLUSTER_CA,
 };
 
 function service(name: string, port = 8000) {
@@ -280,6 +286,51 @@ describe("kubernetes source", () => {
       (calls[0].init?.headers as Record<string, string>).Authorization,
     ).toBe("Bearer sa-token");
     expect(candidates).toHaveLength(2);
+  });
+
+  /**
+   * The API server's certificate is signed by the cluster CA, which is not in
+   * Node's system store. Drop the dispatcher and every call fails TLS against
+   * a real cluster while every mocked test here stays green — the exact shape
+   * this source shipped in. So the dispatcher is asserted on directly.
+   */
+  it("dials the API server through a dispatcher built from the cluster CA", async () => {
+    const { fetchImpl, calls } = stubFetch(async () =>
+      jsonResponse({ items: [service("pool-0")] }),
+    );
+
+    await listAgentServerServices({ config: K8S_CONFIG, fetchImpl });
+
+    const dispatcher = (calls[0].init as { dispatcher?: unknown } | undefined)
+      ?.dispatcher;
+    expect(
+      dispatcher,
+      "no dispatcher: the cluster CA is read and then thrown away",
+    ).toBeDefined();
+    expect(dispatcher).toBeInstanceOf(Agent);
+  });
+
+  it("trusts the CA the pod was given, not an empty one", () => {
+    expect(createClusterDispatcher(CLUSTER_CA)).toBeInstanceOf(Agent);
+    // No `ca.crt` is not an in-cluster run: fall through to NODE_EXTRA_CA_CERTS
+    // and the system store, never to an unverified API server.
+    expect(createClusterDispatcher(null)).toBeNull();
+    expect(createClusterDispatcher(undefined)).toBeNull();
+  });
+
+  it("carries the CA dispatcher through a whole sync, not just a bare list", async () => {
+    const store = createMemoryStore();
+    const { fetchImpl, calls } = stubFetch(async (url: string) => {
+      if (url.includes("/server_info")) return jsonResponse({ version: "1.0" });
+      return jsonResponse({ items: [service("pool-0")] });
+    });
+
+    await syncKubernetesSource({ store, config: K8S_CONFIG, fetchImpl });
+
+    const apiCall = calls.find((call) => call.url.includes("/api/v1/"));
+    expect(
+      (apiCall?.init as { dispatcher?: unknown } | undefined)?.dispatcher,
+    ).toBeInstanceOf(Agent);
   });
 
   it("surfaces an API error instead of reporting an empty fleet", async () => {

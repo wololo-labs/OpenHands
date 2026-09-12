@@ -12,6 +12,8 @@
 
 import { readFile } from "node:fs/promises";
 
+import { Agent, fetch as undiciFetch } from "undici";
+
 import { probeServerInfo, syncSourceEntries } from "./sync.mjs";
 
 const SA_ROOT = "/var/run/secrets/kubernetes.io/serviceaccount";
@@ -56,6 +58,26 @@ export async function readInClusterConfig({
 }
 
 /**
+ * A dispatcher that trusts the cluster's CA, and nothing else.
+ *
+ * The API server presents a certificate signed by the cluster CA, which is
+ * not in Node's system store. Without this every list fails TLS verification,
+ * `startSourceLoop` swallows the error, and the source silently never
+ * populates — the shape this had before it was ever run in a real cluster.
+ *
+ * `ca.crt` is projected into every pod, so its absence means this is not a
+ * normal in-cluster run: fall back to `NODE_EXTRA_CA_CERTS` (which the
+ * operator set deliberately) and to the system store, never to
+ * `rejectUnauthorized: false`. An unverified API server can name any Service
+ * it likes, and each Service becomes a host the fleet proxy will dial with an
+ * injected credential.
+ */
+export function createClusterDispatcher(ca) {
+  if (!ca) return null;
+  return new Agent({ connect: { ca } });
+}
+
+/**
  * A Service's namespaced name is stable for the life of that Service, so it is
  * the identity a discovered entry is keyed by. The `k8s:` prefix keeps it from
  * ever colliding with an SSH fingerprint from signed enrolment.
@@ -85,8 +107,9 @@ export function serviceToCandidate(service) {
 
 export async function listAgentServerServices({
   config,
-  fetchImpl = fetch,
+  fetchImpl = undiciFetch,
   labelSelector = AGENT_SERVER_LABEL_SELECTOR,
+  dispatcher = createClusterDispatcher(config?.ca),
 }) {
   const url = new URL(
     `/api/v1/namespaces/${encodeURIComponent(config.namespace)}/services`,
@@ -96,6 +119,9 @@ export async function listAgentServerServices({
 
   const response = await fetchImpl(url.toString(), {
     headers: { Authorization: `Bearer ${config.token}` },
+    // Dropping this makes every call fail TLS against a real cluster while
+    // every mocked test stays green, so it is asserted on directly.
+    ...(dispatcher ? { dispatcher } : {}),
   });
   if (!response.ok) {
     throw new Error(`kubernetes API responded with ${response.status}`);
@@ -121,14 +147,18 @@ export async function listAgentServerServices({
 export async function syncKubernetesSource({
   store,
   config,
-  fetchImpl = fetch,
+  fetchImpl = undiciFetch,
   labelSelector = AGENT_SERVER_LABEL_SELECTOR,
   now,
 }) {
+  // One dispatcher per sync, not per request: the agent pools connections,
+  // and a fresh one every poll would leak sockets.
+  const dispatcher = createClusterDispatcher(config?.ca);
   const candidates = await listAgentServerServices({
     config,
     fetchImpl,
     labelSelector,
+    dispatcher,
   });
 
   const entries = await Promise.all(
@@ -142,5 +172,9 @@ export async function syncKubernetesSource({
     }),
   );
 
-  return syncSourceEntries({ store, source: K8S_SOURCE, entries, now });
+  try {
+    return syncSourceEntries({ store, source: K8S_SOURCE, entries, now });
+  } finally {
+    await dispatcher?.close();
+  }
 }
