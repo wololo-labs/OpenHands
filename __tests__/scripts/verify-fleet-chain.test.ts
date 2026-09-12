@@ -303,6 +303,15 @@ describe("verifyChain", () => {
     expect(result.ok).toBe(false);
   });
 
+  it("ignores a short sha, because a prefix can exempt more than one commit", () => {
+    const result = verifyChain([commit()], {
+      ...passing,
+      exemptShas: ["a".repeat(7)],
+    } as never);
+    expect(result.skipped).toHaveLength(0);
+    expect(result.unmatched).toEqual(["a".repeat(7)]);
+  });
+
   it("exempts a commit named by sha on the command line, and says so", () => {
     const result = verifyChain([commit()], {
       ...passing,
@@ -408,6 +417,19 @@ describe("createSignatureVerifier (real git, real keys)", () => {
       expectedFingerprint: publicKeyFingerprint(publicKeyPath),
     });
   }
+
+  it("refuses to be built without an expected fingerprint at all", () => {
+    // Omitting it used to skip the anchor check silently, which is the one
+    // line that reverts the whole point of this verifier.
+    expect(() =>
+      // The cast is the test: TypeScript already refuses this call, and the
+      // runtime guard is what protects a JS caller from making it anyway.
+      createSignatureVerifier({
+        repo,
+        publicKeyPath: imposterKeyPub,
+      } as never),
+    ).toThrow(/requires expectedFingerprint/);
+  });
 
   it("accepts a commit signed by the node's key", () => {
     expect(verifier()(signedByNode).ok).toBe(true);

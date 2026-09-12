@@ -7,9 +7,7 @@
  * authenticates as the same GitHub account as the master, so GitHub cannot
  * tell the two apart. Four links can:
  *
- *   1  signature   a good SSH signature from a key generated ON the node,
- *                  whose private half never left it. This is the only link
- *                  that covers the git push, which is not proxy-observable.
+ *   1  signature   a good SSH signature from the node's signing key.
  *   2  trailers    `Fleet-Conversation` and `Fleet-Run` on the commit, the
  *                  run nonce matching the one published before the work.
  *   3  proxy       that conversation seen in the proxy's access log against
@@ -22,14 +20,21 @@
  *   4  events      an agent-sourced event in that conversation naming the
  *                  commit's own subject line.
  *
- * WHAT THE TRUST ANCHOR IS, AND WHAT IT IS NOT. The links are only as strong
- * as the fact that the master did not choose the key it verifies against. So
- * `--signing-key-fingerprint` is required, is checked against the key file,
- * and is meant to be copied from the run's published issue, which carries a
- * server-side timestamp the master cannot backdate. Verifying against a key
- * the master picked at verify time proves only that four files it holds agree
- * with each other. If the fingerprint did not come from the published record,
- * this script is a consistency check and not a proof.
+ * WHAT THIS ASSUMES, AND WHAT IT CHECKS. Two things are assumed and not
+ * verified here. That the signing key was generated on the node and its
+ * private half never left it: nothing in this script can see that, and an
+ * operator with root SSH to the node could have put it there. And that the
+ * published fingerprint really is that key's.
+ *
+ * `--signing-key-fingerprint` is required and is checked against the key file,
+ * so the master cannot point the verifier at a key it holds the private half
+ * of. Its value is meant to be copied from the run's published record. A
+ * GitHub issue carries a server-side creation timestamp AND a readable edit
+ * history, so an anchor added by a later edit is worth only as much as someone
+ * reading `userContentEdits`: publish it as a new comment, before the run,
+ * rather than by editing a body. If the fingerprint did not come from a
+ * published record that predates the work, this script is a consistency check
+ * over files the master holds, and not a proof.
  *
  * COMMITS CI PUSHED. Workflows push commits the node did not make. They are
  * exempt only when named by sha on the command line, never on the strength of
@@ -138,7 +143,7 @@ export function isTunnelledToNode(entry, tunnelMap, fingerprint) {
   if (!host) return false;
   for (const [local, forward] of Object.entries(tunnelMap ?? {})) {
     if (host !== local && !host.startsWith(`${local}/`)) continue;
-    return forward?.fingerprint === fingerprint;
+    return Boolean(fingerprint) && forward?.fingerprint === fingerprint;
   }
   return false;
 }
@@ -301,8 +306,12 @@ export function verifyChain(commits, context) {
   const exempt = [...(context.exemptShas ?? [])].map((sha) =>
     String(sha).toLowerCase(),
   );
+  // Full length only. A prefix can match two commits and exempt both, and
+  // `unmatched` catches an exemption that matched nothing, never one that
+  // matched too much. The list is machine-generated, so there is no ergonomics
+  // argument for the short form.
   const matches = (commit, sha) =>
-    sha.length >= 7 && commit.sha.toLowerCase().startsWith(sha);
+    sha.length === 40 && commit.sha.toLowerCase() === sha;
   const isExempt = (commit) => exempt.some((sha) => matches(commit, sha));
 
   const skipped = commits.filter(isExempt);
@@ -341,6 +350,8 @@ function git(args, { repo }) {
  * arbitrary text and can contain whichever separator the format picked, which
  * splits the record and silently truncates the trailers that follow it.
  */
+// ponytail: two git spawns per commit. Fine at PR scale; batch with `-z`
+// framing if this is ever pointed at a range in the hundreds.
 export function readCommits(range, { repo }) {
   const shas = git(["log", "--format=%H", range], { repo })
     .split("\n")
@@ -398,8 +409,13 @@ export function createSignatureVerifier({
   publicKeyPath,
   expectedFingerprint,
 }) {
+  if (!expectedFingerprint) {
+    // Not optional: omitting it silently skips the check that stops the
+    // verifying machine pointing this at a key it holds the private half of.
+    throw new Error("createSignatureVerifier requires expectedFingerprint");
+  }
   const actual = publicKeyFingerprint(publicKeyPath);
-  if (expectedFingerprint && actual !== expectedFingerprint) {
+  if (actual !== expectedFingerprint) {
     throw new Error(
       `${publicKeyPath} is ${actual}, not the published ${expectedFingerprint}`,
     );
@@ -585,6 +601,7 @@ function main(argv) {
 
   let commits;
   let context;
+  let result;
   try {
     // An events directory that is not there would otherwise fail every commit
     // on link 4 and read as a broken chain rather than a broken invocation.
@@ -603,6 +620,10 @@ function main(argv) {
       }),
       eventsFor: createEventsReader(options.eventsDir),
     };
+    // The run belongs in here too. A throw during verification would otherwise
+    // exit 1 with a stack, which is indistinguishable from "chain is broken",
+    // and that is the one answer this exit code exists to keep separate.
+    result = verifyChain(commits, context);
   } catch (error) {
     // Exit 2, not 1: "the check could not run" and "the chain is broken" are
     // different answers, and a wrapper has to be able to tell them apart.
@@ -610,7 +631,6 @@ function main(argv) {
     return 2;
   }
 
-  const result = verifyChain(commits, context);
   console.log(render(result));
   return result.ok ? 0 : 1;
 }
