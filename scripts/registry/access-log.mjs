@@ -12,9 +12,9 @@
  * handshake, so the SDK passes the session key as a query parameter instead
  * (see `SESSION_KEY_QUERY` in proxy-backend.mjs). The inbound URL of every
  * upgrade therefore carries a live fleet credential, and the naive
- * `log(req.url)` writes it to disk in cleartext. `redactUrl` deletes that
- * parameter before anything is written, and it is the only way a URL enters
- * a line here.
+ * `log(req.url)` writes it to disk in cleartext. `redactUrl` strips every
+ * credential-shaped parameter before anything is written, and it is the only
+ * way a URL enters a line here.
  *
  * Failures are swallowed after one warning: an unwritable evidence file must
  * degrade the record, never the proxy.
@@ -40,9 +40,11 @@ const CREDENTIAL_PARAM_RE = /key|token|secret|auth|password|session|cred/i;
  * with the fragment dropped: a fragment never reaches a server, so anything
  * in one is noise at best and a credential a client misplaced at worst.
  *
- * Returns the input unchanged only when it will not parse at all, because a
- * URL the parser rejects is one the proxy also rejected, and dropping the
- * line entirely would hide a request that did reach the proxy.
+ * Against a base URL almost any path-like request target parses, so the
+ * unchanged-input branch is close to unreachable in practice; it stays for
+ * the few targets `new URL` still refuses, because a URL the parser rejects
+ * is one the proxy rejected too and dropping the line would hide a request
+ * that did reach it.
  */
 export function redactUrl(rawUrl) {
   const raw = String(rawUrl ?? "");
