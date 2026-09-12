@@ -38,6 +38,29 @@ git checkout -b f/stale-entries-in-ui origin/main
 npm ci
 ```
 
+**Check your signing setup before the first commit.** Run this and stop if it prints anything
+other than what is shown:
+
+```
+git config --get gpg.format          # ssh
+git config --get user.signingkey     # /home/claude/.ssh/fleet-node-signing.pub
+git config --get commit.gpgsign      # true
+```
+
+This machine's global git config has silently reverted to the shared OpenPGP key once already. If
+it has reverted again, set it **locally in this clone** so nothing outside the repo can change it
+back mid-run:
+
+```
+git config --local gpg.format ssh
+git config --local user.signingkey /home/claude/.ssh/fleet-node-signing.pub
+git config --local commit.gpgsign true
+git config --local --unset gpg.program
+```
+
+Then confirm one commit actually verifies before doing any real work:
+`git log -1 --format=%H` and tell the operator the sha.
+
 **Every commit must carry both of these trailers, exactly:**
 
 ```

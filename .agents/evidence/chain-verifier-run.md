@@ -72,3 +72,37 @@ EXIT=1
 
 This is the test the whole harness rests on: the machine running the verifier cannot make it pass
 for work that machine did itself, and cannot exempt that work either.
+
+## Falsifier D, found by accident: the node signing with the shared key
+
+Five days after Phase 0, re-running the pass case against a freshly signed commit on the node
+produced this:
+
+```
+FAIL  f53bf02b7c79  chore: signing smoke
+        FAIL signature not signed by SHA256:H5ez7DvuU+IhNEzHK8eELNf5520yO+ZWGn/TR8gEQmE (gpg: Signature made Sat 12 Sep 00:58:40 2026 BST)
+        ok   trailers  conversation 6eb32a33-2591-4ac0-9414-0c2691eb1418
+        ok   proxy     1 proxy line(s) before the commit
+        ok   events    event e1 names it
+
+CHAIN BROKEN
+EXIT=1
+```
+
+The node's global git config had reverted to `gpg.format=openpgp` with
+`user.signingkey=907EC78C72C6AFF6` — **the same OpenPGP key the master signs with**. The commit was
+signed, and GitHub would have shown it verified, and it would have proved nothing at all: either
+machine can produce that signature. This was not a planted test; something on the node rewrites
+`~/.gitconfig`, and the cause has not been chased down.
+
+Three links out of four still passed. The one that failed is the one that had to.
+
+## Exit codes
+
+A throw during verification, rather than during setup, used to exit 1 with a stack trace, which is
+indistinguishable from "the chain is broken". An events export nested 9000 deep now reports:
+
+```
+cannot verify: Maximum call stack size exceeded
+EXIT=2
+```

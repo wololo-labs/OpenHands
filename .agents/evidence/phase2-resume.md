@@ -21,9 +21,20 @@ Everything below was verified in-session unless a line says otherwise.
 | Node workspace | `/home/claude/workspace/project` (created, empty) |
 | Node session key | `~/.openhands/canvas-api-key` on the node |
 
-Node git is already configured to sign: `gpg.format=ssh`,
+Node git is configured to sign: `gpg.format=ssh`,
 `user.signingkey=/home/claude/.ssh/fleet-node-signing.pub`, `commit.gpgsign=true`,
 identity `Steven Gonsalvez <steven.gonsalvez@gmail.com>`.
+
+**This config has drifted once and will drift again.** Five days after it was set, the node's
+global git config had reverted to `gpg.format=openpgp` with `user.signingkey=907EC78C72C6AFF6`,
+which is the *same OpenPGP key the master holds*. A commit signed that way satisfies "signed" and
+proves nothing about which machine made it, because both machines can produce it. Something on the
+node re-writes `~/.gitconfig`; the cause was not chased down.
+
+The chain verifier caught it (`FAIL signature not signed by SHA256:H5ez... (gpg: Signature made
+...)`), which is the system working, but it caught it after the fact. Set the signing config
+**locally in the node's clone** during Phase 2 rather than relying on the global, and re-check it
+at M2, when the first commit lands.
 
 ## Milestones
 
