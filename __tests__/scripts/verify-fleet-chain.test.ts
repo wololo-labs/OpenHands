@@ -10,6 +10,7 @@ import {
   checkProxy,
   checkTrailers,
   collectStrings,
+  createEventsReader,
   createSignatureVerifier,
   isTunnelledToNode,
   parseProxyLog,
@@ -577,4 +578,37 @@ describe("answeredByNode", () => {
   ])("does not count %s", (outcome) => {
     expect(answeredByNode({ outcome })).toBe(false);
   });
+});
+
+describe("createEventsReader", () => {
+  let dir: string;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(path.join(tmpdir(), "fleet-events-"));
+    await writeFile(
+      path.join(dir, "conv-1.json"),
+      JSON.stringify([{ id: "e1", source: "agent" }]),
+      "utf8",
+    );
+  });
+
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("reads the conversation's own export", () => {
+    expect(createEventsReader(dir)("conv-1")).toHaveLength(1);
+  });
+
+  /**
+   * The id is read from the commit's `Fleet-Conversation` trailer, which is
+   * arbitrary text in the artefact being verified: a path there would make
+   * the verifier read an events file the operator never pointed it at.
+   */
+  it.each(["../../tmp/planted", "..", "sub/conv-1", String.raw`..\conv-1`])(
+    "refuses to read through %s",
+    (id) => {
+      expect(createEventsReader(dir)(id)).toEqual([]);
+    },
+  );
 });

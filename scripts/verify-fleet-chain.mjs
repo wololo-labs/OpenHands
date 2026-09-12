@@ -502,6 +502,12 @@ export function createEventsReader(directory) {
   const cache = new Map();
   return (conversationId) => {
     if (!conversationId) return [];
+    // The id comes from the commit's own trailer, which is attacker-chosen
+    // text in the artefact under verification: `../../tmp/planted` would
+    // read an events file outside the directory the operator pointed at.
+    if (/[\\/]/.test(conversationId) || conversationId.includes("..")) {
+      return [];
+    }
     if (cache.has(conversationId)) return cache.get(conversationId);
 
     let events = [];
