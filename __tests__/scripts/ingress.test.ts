@@ -1,12 +1,11 @@
 import { createServer, request, type Server } from "node:http";
 import { connect as netConnect, type AddressInfo, type Socket } from "node:net";
-import { networkInterfaces } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import type { Duplex } from "node:stream";
 import { spawn, type ChildProcess } from "node:child_process";
 import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -36,7 +35,8 @@ const loopbackHost = "127.0.0.1";
 function nonLoopbackAddress(): string | null {
   for (const addresses of Object.values(networkInterfaces())) {
     for (const address of addresses ?? []) {
-      if (address.family === "IPv4" && !address.internal) return address.address;
+      if (address.family === "IPv4" && !address.internal)
+        return address.address;
     }
   }
   return null;
@@ -494,12 +494,26 @@ describe("ingress --host", () => {
     ingressProcess = undefined;
   });
 
-  async function startIngressOn(hostArgs: string[], env: NodeJS.ProcessEnv = {}) {
+  async function startIngressOn(
+    hostArgs: string[],
+    env: NodeJS.ProcessEnv = {},
+  ) {
     const port = await getFreePort();
     ingressProcess = spawn(
       process.execPath,
-      [ingressScript, "--port", port.toString(), "--default", "http://127.0.0.1:1", ...hostArgs],
-      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } },
+      [
+        ingressScript,
+        "--port",
+        port.toString(),
+        "--default",
+        "http://127.0.0.1:1",
+        ...hostArgs,
+      ],
+      {
+        cwd: repoRoot,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, ...env },
+      },
     );
     await waitForPort(port, ingressProcess);
     return port;

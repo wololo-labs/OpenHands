@@ -22,7 +22,11 @@ describe("buildRegistryConfig", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     expect(
-      buildRegistryConfig({ accessLog: "/tmp/x.jsonl" }, {}, resolveAgentServer),
+      buildRegistryConfig(
+        { accessLog: "/tmp/x.jsonl" },
+        {},
+        resolveAgentServer,
+      ),
     ).toBeNull();
 
     // Naming the flag is the point: an operator who asked for the wire record
@@ -66,8 +70,9 @@ describe("buildRegistryConfig", () => {
   });
 
   it("refuses to enable a registry with nowhere to store it", () => {
-    expect(() => buildRegistryConfig({ sessionKey: "k" }, {}, () => null))
-      .toThrowError(/no agent server/);
+    expect(() =>
+      buildRegistryConfig({ sessionKey: "k" }, {}, () => null),
+    ).toThrowError(/no agent server/);
   });
 });
 

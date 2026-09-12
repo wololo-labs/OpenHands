@@ -191,18 +191,15 @@ test.beforeAll(async ({ request }) => {
   // route to it at all. `/api` is in the front door's route table in both
   // profiles, which is the whole reason the registry defaults to storing
   // itself there.
-  const response = await request.patch(
-    `${rig.baseUrl}/api/settings`,
-    {
-      headers: masterAuth,
-      data: {
-        misc_settings_diff: {
-          app_preferences: { user_consents_to_analytics: false },
-        },
+  const response = await request.patch(`${rig.baseUrl}/api/settings`, {
+    headers: masterAuth,
+    data: {
+      misc_settings_diff: {
+        app_preferences: { user_consents_to_analytics: false },
       },
-      failOnStatusCode: false,
     },
-  );
+    failOnStatusCode: false,
+  });
   expect(response.ok(), "could not silence the consent modal").toBe(true);
 });
 
@@ -545,9 +542,9 @@ test("the browser holds no fleet credential and sends none", async ({
     true,
   );
   const nodeKeys = [rig.keys.node1, rig.keys.node2].filter(Boolean);
-  expect(
-    fleet.some((backend) => nodeKeys.includes(backend.apiKey)),
-  ).toBe(false);
+  expect(fleet.some((backend) => nodeKeys.includes(backend.apiKey))).toBe(
+    false,
+  );
 
   expect(
     proxied.length,
@@ -737,7 +734,10 @@ test("a browser that has never seen the fleet renders it anyway", async ({
 test("a conversation runs on the remote node through the proxy", async ({
   request,
 }) => {
-  test.skip(!TAILNET, "`claude`/ACP is not installed in-cluster, so no model turn can run there");
+  test.skip(
+    !TAILNET,
+    "`claude`/ACP is not installed in-cluster, so no model turn can run there",
+  );
 
   const proxied = `${rig.baseUrl}/backend/${rig.entries.node1.id}`;
 
@@ -899,10 +899,9 @@ test("a conversation runs on the remote node through the proxy", async ({
     socket.addEventListener("error", () => settle(false));
     setTimeout(() => settle(false), 20_000);
   });
-  expect(
-    upgraded,
-    "the event socket never upgraded through the proxy",
-  ).toBe(true);
+  expect(upgraded, "the event socket never upgraded through the proxy").toBe(
+    true,
+  );
 
   // The proxy records what the node answered, so a 101 here is the node
   // accepting the socket, not the master reporting that it dialled.
@@ -978,7 +977,13 @@ test("re-enrolling updates in place and never escalates trust", async ({
 function kubectl(...args: string[]): string {
   return execFileSync(
     "kubectl",
-    ["--kubeconfig", rig.kubeconfig as string, "-n", rig.namespace as string, ...args],
+    [
+      "--kubeconfig",
+      rig.kubeconfig as string,
+      "-n",
+      rig.namespace as string,
+      ...args,
+    ],
     { encoding: "utf8" },
   ).trim();
 }
@@ -1097,8 +1102,8 @@ test("scaling the pool changes the fleet within one poll, with nothing enrolled"
 
   await pollForEntries(
     request,
-    (entries) => entries.filter((e) => e.state === "active").length ===
-      before.length + 1,
+    (entries) =>
+      entries.filter((e) => e.state === "active").length === before.length + 1,
     "the new pool member never reached the registry",
   );
 

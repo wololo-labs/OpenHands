@@ -88,12 +88,15 @@ function proxyLine(overrides: Record<string, unknown> = {}) {
 const COMMITTED_AT = "2026-09-12T11:00:00.000Z";
 
 test("control: a proxy line for another machine does not prove this one", () => {
-  const verdict = checkProxy([proxyLine({ entryFingerprint: OTHER_FINGERPRINT })], {
-    conversationId: "conv-1",
-    committedAt: COMMITTED_AT,
-    fingerprint: NODE_FINGERPRINT,
-    tunnelMap: TUNNEL_MAP,
-  });
+  const verdict = checkProxy(
+    [proxyLine({ entryFingerprint: OTHER_FINGERPRINT })],
+    {
+      conversationId: "conv-1",
+      committedAt: COMMITTED_AT,
+      fingerprint: NODE_FINGERPRINT,
+      tunnelMap: TUNNEL_MAP,
+    },
+  );
 
   expect(verdict.ok, "another machine's fingerprint satisfied the check").toBe(
     false,
@@ -150,15 +153,12 @@ test("control: a host the tunnel map does not vouch for is not that machine", ()
 });
 
 test("control: a proxy line written after the commit proves nothing", () => {
-  const verdict = checkProxy(
-    [proxyLine({ ts: "2026-09-12T12:00:00.000Z" })],
-    {
-      conversationId: "conv-1",
-      committedAt: COMMITTED_AT,
-      fingerprint: NODE_FINGERPRINT,
-      tunnelMap: TUNNEL_MAP,
-    },
-  );
+  const verdict = checkProxy([proxyLine({ ts: "2026-09-12T12:00:00.000Z" })], {
+    conversationId: "conv-1",
+    committedAt: COMMITTED_AT,
+    fingerprint: NODE_FINGERPRINT,
+    tunnelMap: TUNNEL_MAP,
+  });
 
   expect(verdict.ok).toBe(false);
   expect(verdict.reason).toContain("after the commit");
@@ -195,7 +195,10 @@ test("control: a stale --exempt fails the run instead of being ignored", () => {
 
   // And a real exemption that leaves nothing to check is not a pass either: a
   // range where every commit is exempted has verified nothing.
-  const everything = verifyChain([commit], { ...context, exemptShas: [commit.sha] });
+  const everything = verifyChain([commit], {
+    ...context,
+    exemptShas: [commit.sha],
+  });
   expect(everything.ok, "an empty range passed").toBe(false);
   expect(everything.empty).toBe(true);
 
@@ -349,17 +352,20 @@ test("forgery: a registration flood cannot crowd out a real node", async ({
   const attempts = 40;
   const statuses: number[] = [];
   for (let i = 0; i < attempts; i += 1) {
-    const response = await request.post(`${rig.baseUrl}/api/registry/register`, {
-      headers: { "Content-Type": "application/json" },
-      data: {
-        name: `flood-${i}`,
-        host: "http://127.0.0.1:1",
-        pubkey: `ssh-ed25519 ${randomBytes(51).toString("base64")} flood@${i}`,
-        nonce: randomBytes(16).toString("hex"),
-        ts: Math.floor(Date.now() / 1000),
+    const response = await request.post(
+      `${rig.baseUrl}/api/registry/register`,
+      {
+        headers: { "Content-Type": "application/json" },
+        data: {
+          name: `flood-${i}`,
+          host: "http://127.0.0.1:1",
+          pubkey: `ssh-ed25519 ${randomBytes(51).toString("base64")} flood@${i}`,
+          nonce: randomBytes(16).toString("hex"),
+          ts: Math.floor(Date.now() / 1000),
+        },
+        failOnStatusCode: false,
       },
-      failOnStatusCode: false,
-    });
+    );
     statuses.push(response.status());
   }
 
@@ -382,7 +388,10 @@ test("forgery: a registration flood cannot crowd out a real node", async ({
   // after the assertions that revoke one, so naming an entry up front would
   // assert against a machine that is meant to be refused.
   const working = after.find((entry) => entry.state === "active");
-  expect(working, "no active entry left to prove the fleet still works").toBeDefined();
+  expect(
+    working,
+    "no active entry left to prove the fleet still works",
+  ).toBeDefined();
   const response = await request.get(
     `${rig.baseUrl}/backend/${(working as RigEntry).id}/server_info`,
     { headers: masterAuth, failOnStatusCode: false },

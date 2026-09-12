@@ -77,19 +77,32 @@ function jsonResponse(body: unknown, status = 200) {
   });
 }
 
-/** Typed as `fetch` so it can stand in for it, recorded so it can be asserted on. */
+/**
+ * Typed as undici's `fetch` rather than the global one, because that is what
+ * the Kubernetes source calls: it needs a client whose `dispatcher` option is
+ * honoured, and Node's built-in fetch takes no CA. Recorded so the call can be
+ * asserted on.
+ */
 function stubFetch(
   impl: (url: string, init?: RequestInit) => Promise<Response>,
 ) {
   const calls: { url: string; init?: RequestInit }[] = [];
-  const fetchImpl = ((input: RequestInfo | URL, init?: RequestInit) => {
+  // `any`, deliberately: this one double stands in for two different fetch
+  // types. `probeServerInfo` and the tailnet source take Node's global fetch;
+  // the Kubernetes source takes undici's, because it needs a client whose
+  // `dispatcher` option is honoured and the global one accepts no CA. The two
+  // signatures are not mutually assignable, and narrowing to either would make
+  // half the call sites below fail to typecheck for no behavioural reason.
+
+  const fetchImpl = ((input: unknown, init?: RequestInit) => {
     calls.push({ url: String(input), init });
     return impl(String(input), init);
-  }) as typeof fetch;
+  }) as any;
   return { fetchImpl, calls };
 }
 
-const CLUSTER_CA = "-----BEGIN CERTIFICATE-----\nnot-a-real-ca\n-----END CERTIFICATE-----";
+const CLUSTER_CA =
+  "-----BEGIN CERTIFICATE-----\nnot-a-real-ca\n-----END CERTIFICATE-----";
 
 const K8S_CONFIG = {
   apiServer: "https://10.0.0.1:443",
