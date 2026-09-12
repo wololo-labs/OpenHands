@@ -105,6 +105,10 @@ spec:
             - name: REGISTRY_SOURCE_KUBERNETES
               value: "1"
             {{- end }}
+            {{- with .Values.registry.sourceIntervalSeconds }}
+            - name: REGISTRY_SOURCE_INTERVAL_MS
+              value: {{ mul . 1000 | quote }}
+            {{- end }}
             {{- if .Values.registry.sources.tailnet.enabled }}
             - name: REGISTRY_SOURCE_TAILNET
               value: "1"
