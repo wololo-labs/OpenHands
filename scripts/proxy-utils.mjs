@@ -280,7 +280,39 @@ export function createProxyHandlers({
     }
   }
 
-  function proxyWebSocket(req, socket, head, target) {
+  /**
+   * The upstream status of one upgrade, reported once.
+   *
+   * httpxy exposes the upstream request for an upgrade only through a
+   * server-wide event, so the listener finds its own request by identity and
+   * then takes itself off again. Without this an upgrade the node refused and
+   * one it accepted are indistinguishable to a caller.
+   */
+  function watchUpgradeStatus(req, socket, onUpstreamStatus) {
+    const report = once(onUpstreamStatus);
+    const listener = (proxyReq, incoming) => {
+      if (incoming !== req) return;
+      proxy.off("proxyReqWs", listener);
+      proxyReq.once("upgrade", () => report(101));
+      proxyReq.once("response", (proxyRes) => report(proxyRes.statusCode));
+      proxyReq.once("error", () => report(null));
+    };
+    proxy.on("proxyReqWs", listener);
+    // The event never fires if the upgrade dies before the request is made.
+    socket.once("close", () => {
+      proxy.off("proxyReqWs", listener);
+      report(null);
+    });
+  }
+
+  function proxyWebSocket(
+    req,
+    socket,
+    head,
+    target,
+    { onUpstreamStatus } = {},
+  ) {
+    if (onUpstreamStatus) watchUpgradeStatus(req, socket, onUpstreamStatus);
     metrics.activeWebSockets += 1;
     metrics.totalWebSockets += 1;
     const finish = once(() => {
