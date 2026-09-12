@@ -100,10 +100,33 @@ test.describe.configure({ mode: "serial" });
 
 const masterAuth = { "X-Session-API-Key": rig.keys.master };
 
+/**
+ * Retries a request once when the *transport* fails, never when the server
+ * answers.
+ *
+ * In the k8s profile the only way in is a `kubectl port-forward`, and it drops
+ * an individual connection from time to time — the listener stays up and the
+ * next request succeeds. That is a property of the viewer's tunnel, not an
+ * answer from the registry, and an unattended run should not fail on it. An
+ * HTTP status is never retried: that is the thing under test.
+ */
+async function throughTheTunnel<T>(attempt: () => Promise<T>): Promise<T> {
+  try {
+    return await attempt();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/socket hang up|ECONNRESET|ECONNREFUSED|EPIPE/i.test(message)) {
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    return attempt();
+  }
+}
+
 async function listEntries(request: APIRequestContext): Promise<RigEntry[]> {
-  const response = await request.get(`${rig.baseUrl}/api/registry`, {
-    headers: masterAuth,
-  });
+  const response = await throughTheTunnel(() =>
+    request.get(`${rig.baseUrl}/api/registry`, { headers: masterAuth }),
+  );
   expect(response.status(), "the registry must answer a keyed read").toBe(200);
   return (await response.json()).entries as RigEntry[];
 }
@@ -119,15 +142,29 @@ function entryNamed(entries: RigEntry[], name: string): RigEntry {
  * the caller. That absence is the whole point: whatever reaches the node has
  * to have been put there by the ingress.
  */
+/**
+ * A path that a working entry answers 200 on, in this profile.
+ *
+ * The tailnet profile places a credential for each node out of band, so an
+ * authenticated route is the stronger probe: a 200 there is only explicable by
+ * the proxy having injected the node's own key. The k8s profile distributes no
+ * keys at all — membership of the namespace is the whole of the trust — so the
+ * same route correctly answers 401 and the honest liveness probe is the
+ * unauthenticated one the discovery source itself uses.
+ */
+const LIVENESS_PATH = TAILNET ? "/api/conversations/search" : "/server_info";
+
 async function proxyStatus(
   request: APIRequestContext,
   entryId: string,
-  path_ = "/api/conversations/search",
+  path_ = LIVENESS_PATH,
   headers: Record<string, string> = masterAuth,
 ): Promise<number> {
-  const response = await request.get(
-    `${rig.baseUrl}/backend/${entryId}${path_}`,
-    { headers, failOnStatusCode: false },
+  const response = await throughTheTunnel(() =>
+    request.get(`${rig.baseUrl}/backend/${entryId}${path_}`, {
+      headers,
+      failOnStatusCode: false,
+    }),
   );
   return response.status();
 }
@@ -202,9 +239,20 @@ async function dismissConsentModal(page: Page): Promise<void> {
 async function openSwitcher(page: Page) {
   await page.getByTestId("backend-selector").hover();
   const options = page.locator("li");
-  await expect(
-    options.filter({ hasText: MANUAL_BACKEND_NAME }).first(),
-  ).toBeVisible({ timeout: 15_000 });
+  // Anchored on the manual entry where the launcher seeds one, and otherwise
+  // on the list being populated at all. Never on a fleet row: the callers
+  // assert about those, including their absence after a revocation, so
+  // waiting for one would make this helper wait for the very thing a test is
+  // proving has gone.
+  const manual = options.filter({ hasText: MANUAL_BACKEND_NAME }).first();
+  await expect
+    .poll(
+      async () =>
+        (await manual.isVisible().catch(() => false)) ||
+        (await options.count()) > 0,
+      { timeout: 15_000, message: "the backend switcher never populated" },
+    )
+    .toBe(true);
   return options;
 }
 

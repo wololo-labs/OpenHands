@@ -26,7 +26,8 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import path from "node:path";
 
 import { expect, test, type APIRequestContext } from "@playwright/test";
 
@@ -255,6 +256,21 @@ test("forgery: the verifier refuses a signing key the master holds", () => {
   // the published fingerprint is what has to stop it.
   const evidence = `${rig.dir}/evidence`;
   mkdirSync(`${evidence}/events`, { recursive: true });
+  // The verifier reads its inputs before it checks the key, so they all have
+  // to exist or it refuses for the wrong reason — and a refusal for the wrong
+  // reason is exactly what this test would otherwise mistake for a pass. The
+  // k8s profile keeps no access log (the in-cluster canvas is not given one),
+  // so an empty one stands in: a log with no lines is a legitimate input, and
+  // the key is still the only thing wrong.
+  for (const [file, contents] of [
+    [rig.accessLogPath, ""],
+    [rig.tunnelMapPath, "{}"],
+  ] as const) {
+    if (!existsSync(file)) {
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, contents, "utf8");
+    }
+  }
   const keyPath = `${evidence}/master-held-key`;
   rmSync(keyPath, { force: true });
   rmSync(`${keyPath}.pub`, { force: true });
