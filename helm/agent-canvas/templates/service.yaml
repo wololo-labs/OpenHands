@@ -5,12 +5,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "agent-canvas.labels" . | nindent 4 }}
-    {{- if .Values.agentPool.enabled }}
-    # Discovery label read by scripts/registry/sources/k8s.mjs. It is an extra
-    # label, never a selector label: changing selectors on an existing release
-    # is rejected by Kubernetes.
-    app.kubernetes.io/name: agent-server
-    {{- end }}
   {{- with .Values.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -47,3 +41,41 @@ spec:
       protocol: TCP
   selector:
     {{- include "agent-canvas.selectorLabels" . | nindent 4 }}
+
+{{- if .Values.agentPool.enabled }}
+{{- $fullName := include "agent-canvas.fullname" . }}
+{{- $root := . }}
+{{- range $index := until (int .Values.agentPool.replicas) }}
+---
+# One Service per pool member, addressed by the cluster DNS name
+# `<name>.<namespace>.svc.cluster.local` that the registry's Kubernetes source
+# builds. Per member, not one in front of all of them: pool members each keep
+# their own conversations on their own PVC, so a Service load-balancing across
+# them would answer a conversation lookup from whichever member happened to be
+# picked. Discovery by Service is then also discovery by member, which is what
+# makes the backend switcher list machines rather than one endpoint.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullName }}-{{ $index }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "agent-canvas.labels" $root | nindent 4 }}
+    # The label scripts/registry/sources/k8s.mjs selects on. It names what the
+    # Service fronts (an agent server), which is why it differs from the
+    # chart's own app.kubernetes.io/name.
+    app.kubernetes.io/name: agent-server
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ $root.Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "agent-canvas.selectorLabels" $root | nindent 4 }}
+    # Set by the StatefulSet controller on every pod it owns, so this Service
+    # resolves to exactly one member.
+    statefulset.kubernetes.io/pod-name: {{ $fullName }}-{{ $index }}
+{{- end }}
+{{- end }}

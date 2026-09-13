@@ -404,6 +404,32 @@ of an author or committer name, which are strings anyone can set.
 Exit codes distinguish the two failures: 1 is a broken chain, 2 is a check that
 could not be run.
 
+## Which deployments are supported
+
+An entry is a URL plus a credential reference, and the proxy dials that URL.
+Nothing in the registry knows what a tunnel is, so what a deployment has to
+answer is how a node becomes **dialable**.
+
+| Profile | How the node is reached | Membership | Status |
+|---|---|---|---|
+| **A — in-cluster** | `http://<svc>.<ns>.svc.cluster.local:<port>` | Services labelled `app.kubernetes.io/name=agent-server` | **supported**, proven against a real cluster |
+| **B — private overlay** | `https://<node>.<tailnet>:8443` over tailscale or wireguard | push enrolment signed by the node's SSH host key | **supported**, proven against two real VMs |
+| **C — cloud edge** | a public ingress with mutual TLS | push enrolment | needs no registry code; not attempted, because it needs an ingress controller and certificates |
+| **D — egress-only** | *nothing: the node has no inbound path* | — | **not supported.** See "Reachability profiles" in `specs/fleet-registry.md` |
+
+Profile D is the honest gap. A node that can only make outbound connections —
+a laptop behind NAT, a VPC with no ingress, a network that permits outbound 443
+and nothing else — cannot be served by any of the above, because every one of
+them ends in the master dialling the node. Supporting it means inverting the
+direction of the connection and running a stateful relay that holds one channel
+per node, which is the property every profile here avoids by design. It is
+specified and deferred, not quietly missing.
+
+SSH is not a transport in any profile. Where this documentation and the live
+rig use it, it is provisioning: installing k3s, or running the enrolment client
+on the machine that holds the host key, because only that machine can sign for
+itself.
+
 ## Validating against real machines
 
 Every other registry test in this repository uses a fake. The live rig runs the
@@ -411,10 +437,38 @@ whole loop against real agent servers, one of them on another host, enrolled
 with that host's own SSH key:
 
 ```bash
-node tests/e2e/live/fleet-registry/rig.mjs up      # stand it up and enrol both nodes
-npm run test:e2e:fleet-registry                    # enrol -> pending -> approve -> proxy -> revoke
-node tests/e2e/live/fleet-registry/rig.mjs down    # kill by recorded PID, drop secrets, clear entries
+# Profile B: two real VMs on the overlay
+node tests/e2e/live/fleet-registry/rig.mjs up --profile tailnet
+PROFILE=tailnet npm run test:e2e:fleet-registry
+node tests/e2e/live/fleet-registry/rig.mjs down
+
+# Profile A: a real k3s cluster, installed from nothing and removed again
+node tests/e2e/live/fleet-registry/rig.mjs up --profile k8s
+PROFILE=k8s npm run test:e2e:fleet-registry
+node tests/e2e/live/fleet-registry/rig.mjs down
 ```
+
+One spec, two profiles: reachability is the only difference, which is the
+claim. Profile-specific assertions say in their skip reason why they cannot be
+made in the other profile, so a gate is never silent. The spec reads the
+profile from the rig's own state file rather than from the environment —
+`PROFILE=k8s` against a tailnet rig is refused rather than skipping the
+assertions that apply and running the ones that cannot.
+
+Proving the suite can fail is a separate, standing job:
+
+```bash
+# permanent: negative controls and forgery attempts, run with every suite
+#   tests/e2e/live/fleet-registry/falsification.spec.ts
+
+# on demand: revert each gating fix, watch a NAMED assertion go red, restore
+node tests/e2e/live/fleet-registry/deliberate-breakage.mjs
+```
+
+The k8s profile installs k3s on the target VM and uninstalls it again on
+teardown, so every run pays for install-from-nothing. It reaches the canvas
+only through a rig-managed `kubectl port-forward`: that profile exists to prove
+no overlay is needed, so it does not get to use one.
 
 The rig is deliberately hermetic: random ports in 39000-39999, a state
 directory under `$TMPDIR/fleet-rig-<ts>`, and `HOME` pointed inside it so the
@@ -466,12 +520,21 @@ no resolver for it are the common case), the fix is a resolver entry:
 printf 'nameserver 100.100.100.100\n' | sudo tee /etc/resolver/ts.net
 ```
 
-Where that is not available, forward the node's port instead and register the
-forwarded address as the entry's host:
+Where that is not available either — an unattended run has no way to become
+root — resolution can be supplied to the master process alone. The live rig
+does this: `tests/e2e/live/fleet-registry/magicdns.mjs`, loaded with
+`node --import`, asks `100.100.100.100` for `*.ts.net` and hands everything
+else to the OS. It is rig-only and nothing in `scripts/` knows it exists; on a
+host whose resolver works it returns exactly what `getaddrinfo` would have.
+
+The last resort, if even that is unavailable, is to forward the node's port and
+register the forwarded address as the entry's host:
 
 ```bash
 ssh -N -L 127.0.0.1:39165:127.0.0.1:8000 claude@100.125.222.64
 ```
 
-The hop still runs over the tailnet; only name resolution moves. This is what
-the live rig does, so it does not depend on the operator's DNS.
+The hop still runs over the tailnet; only name resolution moves. It costs the
+certificate check, though — a loopback port proves nothing about which machine
+answered — so an entry registered that way needs a tunnel map alongside it for
+any evidence to mean anything. Prefer the resolver.

@@ -1,11 +1,11 @@
 import { createServer, request, type Server } from "node:http";
 import { connect as netConnect, type AddressInfo, type Socket } from "node:net";
+import { networkInterfaces, tmpdir } from "node:os";
 import type { Duplex } from "node:stream";
 import { spawn, type ChildProcess } from "node:child_process";
 import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -26,6 +26,21 @@ const repoRoot = path.resolve(
 
 const ingressScript = path.join(repoRoot, "scripts", "ingress.mjs");
 const loopbackHost = "127.0.0.1";
+
+/**
+ * An IPv4 address of this machine that is not loopback — the address a peer
+ * on the same network would dial. `null` on a host that has none, where the
+ * bind assertions cannot be made and say so instead of passing vacuously.
+ */
+function nonLoopbackAddress(): string | null {
+  for (const addresses of Object.values(networkInterfaces())) {
+    for (const address of addresses ?? []) {
+      if (address.family === "IPv4" && !address.internal)
+        return address.address;
+    }
+  }
+  return null;
+}
 
 function originForPort(port: number) {
   return `http://${loopbackHost}:${port}`;
@@ -78,9 +93,9 @@ async function getFreePort() {
   }
 }
 
-async function canConnect(port: number) {
+async function canConnect(port: number, host: string = loopbackHost) {
   return new Promise<boolean>((resolve) => {
-    const socket = netConnect({ host: loopbackHost, port });
+    const socket = netConnect({ host, port });
     let settled = false;
     const finish = (connected: boolean) => {
       if (settled) {
@@ -362,6 +377,195 @@ describe("ingress.mjs CLI", () => {
     } finally {
       await stopChild(child);
     }
+  });
+});
+
+describe("ingress malformed request lines", () => {
+  let ingressProcess: ChildProcess | undefined;
+  let upstream: Server | undefined;
+  let stderr: string;
+
+  afterEach(async () => {
+    await stopChild(ingressProcess);
+    ingressProcess = undefined;
+    await closeServer(upstream);
+    upstream = undefined;
+  });
+
+  /**
+   * Writes a raw request line Node's HTTP parser accepts and the WHATWG URL
+   * parser rejects. `fetch` cannot send this: it would normalise or refuse the
+   * URL, so the socket is written by hand.
+   */
+  async function sendRawRequest(port: number, requestLine: string) {
+    await new Promise<void>((resolve) => {
+      const socket = netConnect({ host: loopbackHost, port }, () => {
+        socket.write(
+          `${requestLine} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`,
+        );
+      });
+      socket.on("error", () => resolve());
+      socket.on("close", () => resolve());
+      socket.setTimeout(2000, () => {
+        socket.destroy();
+        resolve();
+      });
+    });
+    await delay(150);
+  }
+
+  async function startIngress(extraArgs: string[]) {
+    upstream = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const upstreamPort = await listenOnLoopback(upstream);
+    const port = await getFreePort();
+    stderr = "";
+    ingressProcess = spawn(
+      process.execPath,
+      [
+        ingressScript,
+        "--port",
+        port.toString(),
+        "--default",
+        originForPort(upstreamPort),
+        ...extraArgs,
+      ],
+      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    ingressProcess.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    await waitForPort(port, ingressProcess);
+    return port;
+  }
+
+  /**
+   * The registry check runs in the request listener before any authentication,
+   * so an unparseable request line reaching a bare `new URL` there is an
+   * unauthenticated remote kill of the master and everything it is proxying
+   * for. One `GET //[` was enough.
+   */
+  it("survives GET //[ with the registry mounted", async () => {
+    const port = await startIngress([
+      "--registry-session-key",
+      "test-key",
+      "--registry-agent-server",
+      "http://127.0.0.1:1",
+    ]);
+
+    await sendRawRequest(port, "GET //[");
+
+    expect(
+      ingressProcess?.exitCode,
+      "the ingress died on an unauthenticated malformed request line",
+    ).toBeNull();
+    expect(stderr).not.toMatch(/ERR_INVALID_URL/);
+    expect((await getJson(`${originForPort(port)}/anything`)).status).toBe(200);
+  });
+
+  /**
+   * The /server_info interception parses the same way, one branch later, and
+   * only when --runtime-services-info is set. Guarding the registry alone left
+   * this one live.
+   */
+  it("survives GET //[ with /server_info interception on", async () => {
+    const port = await startIngress([
+      "--runtime-services-info",
+      JSON.stringify({ vscode: { url: "http://127.0.0.1:1" } }),
+    ]);
+
+    await sendRawRequest(port, "GET //[");
+
+    expect(
+      ingressProcess?.exitCode,
+      "the ingress died parsing a malformed request line for /server_info",
+    ).toBeNull();
+    expect((await getJson(`${originForPort(port)}/anything`)).status).toBe(200);
+  });
+});
+
+describe("ingress --host", () => {
+  let ingressProcess: ChildProcess | undefined;
+
+  afterEach(async () => {
+    await stopChild(ingressProcess);
+    ingressProcess = undefined;
+  });
+
+  async function startIngressOn(
+    hostArgs: string[],
+    env: NodeJS.ProcessEnv = {},
+  ) {
+    const port = await getFreePort();
+    ingressProcess = spawn(
+      process.execPath,
+      [
+        ingressScript,
+        "--port",
+        port.toString(),
+        "--default",
+        "http://127.0.0.1:1",
+        ...hostArgs,
+      ],
+      {
+        cwd: repoRoot,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, ...env },
+      },
+    );
+    await waitForPort(port, ingressProcess);
+    return port;
+  }
+
+  /**
+   * This process serves /api/registry and /backend/:id — the fleet's
+   * credentials. Before --host existed it called `server.listen(port)` with no
+   * address, which binds every interface, so every machine on the network
+   * could reach them.
+   */
+  it("binds loopback only by default", async () => {
+    const external = nonLoopbackAddress();
+    expect(
+      external,
+      "this host has no non-loopback IPv4, so the bind cannot be proven here",
+    ).not.toBeNull();
+
+    const port = await startIngressOn([]);
+
+    expect(await canConnect(port, loopbackHost)).toBe(true);
+    expect(await canConnect(port, external as string)).toBe(false);
+  });
+
+  it("binds every interface when asked to, explicitly", async () => {
+    const external = nonLoopbackAddress();
+    expect(external).not.toBeNull();
+
+    const port = await startIngressOn(["--host", "0.0.0.0"]);
+
+    expect(await canConnect(port, external as string)).toBe(true);
+  });
+
+  it("takes the bind address from INGRESS_HOST too", async () => {
+    const external = nonLoopbackAddress();
+    expect(external).not.toBeNull();
+
+    const port = await startIngressOn([], { INGRESS_HOST: "0.0.0.0" });
+
+    expect(await canConnect(port, external as string)).toBe(true);
+  });
+
+  it("lets the flag win over the environment", async () => {
+    const external = nonLoopbackAddress();
+    expect(external).not.toBeNull();
+
+    const port = await startIngressOn(["--host", "127.0.0.1"], {
+      INGRESS_HOST: "0.0.0.0",
+    });
+
+    expect(await canConnect(port, loopbackHost)).toBe(true);
+    expect(await canConnect(port, external as string)).toBe(false);
   });
 });
 

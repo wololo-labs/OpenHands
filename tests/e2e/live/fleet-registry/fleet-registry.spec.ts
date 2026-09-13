@@ -1,15 +1,31 @@
 /**
- * Live end-to-end proof of the fleet registry, against real machines.
+ * Live end-to-end proof of the fleet registry, against real machines, in two
+ * reachability profiles.
  *
  * Every other registry test in this repository uses a fake: a stub provider, a
  * stub `fetch`, an in-memory store. This one runs against a rig that
- * `tests/e2e/live/fleet-registry/rig.mjs` stands up — a throwaway master stack
- * plus two real agent servers, one of them on another machine, enrolled with
- * that machine's own SSH host key.
+ * `tests/e2e/live/fleet-registry/rig.mjs` stands up.
  *
- *   node tests/e2e/live/fleet-registry/rig.mjs up
+ *   node tests/e2e/live/fleet-registry/rig.mjs up --profile tailnet
  *   npm run test:e2e:fleet-registry
  *   node tests/e2e/live/fleet-registry/rig.mjs down
+ *
+ *   node tests/e2e/live/fleet-registry/rig.mjs up --profile k8s
+ *   npm run test:e2e:fleet-registry
+ *   node tests/e2e/live/fleet-registry/rig.mjs down
+ *
+ * One body, two profiles: reachability is the only difference, which is the
+ * claim being made. What changes is how a machine becomes dialable —
+ *
+ *   tailnet  two real VMs on a private overlay, addressed by the MagicDNS
+ *            name each one's `tailscale serve` terminates TLS for. Membership
+ *            is push enrolment signed by the node's own SSH host key.
+ *   k8s      one real k3s cluster built from nothing, addressed by cluster
+ *            DNS. Membership is the Service list: no enrolment, no key
+ *            distribution, no pre-seeded fingerprint, no overlay.
+ *
+ * — and the profile-gated tests say in their skip reason why an assertion
+ * cannot be made in the other profile, so a gate is never silent.
  *
  * It is deliberately kept out of `npm test` and out of the default Playwright
  * project: it needs a reachable remote host and cannot run in ordinary CI.
@@ -24,7 +40,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import {
@@ -37,6 +53,9 @@ import {
 } from "@playwright/test";
 
 import { readRigState, type RigEntry, type RigState } from "./rig-state";
+// The tailnet profile addresses nodes by MagicDNS name, and this Mac's system
+// resolver refuses those; the API-request assertions below dial them directly.
+import "./magicdns.mjs";
 
 const rig: RigState = readRigState();
 const EVIDENCE_DIR = path.join(rig.dir, "evidence");
@@ -44,6 +63,34 @@ const NODE1 = rig.entries.node1.name;
 const NODE2 = rig.entries.node2.name;
 /** The master's own entry, seeded by the launcher and never registry-owned. */
 const MANUAL_BACKEND_NAME = "Local";
+
+/**
+ * The profile the running rig was brought up in. Taken from the rig's own
+ * state rather than from the environment: `PROFILE=k8s` against a tailnet rig
+ * would otherwise skip the assertions that do apply and run the ones that
+ * cannot, and report green for a fleet nobody tested.
+ */
+const PROFILE = rig.profile ?? "tailnet";
+const TAILNET = PROFILE === "tailnet";
+const K8S = PROFILE === "k8s";
+
+if (process.env.PROFILE && process.env.PROFILE !== PROFILE) {
+  throw new Error(
+    `PROFILE=${process.env.PROFILE} but the running rig is "${PROFILE}". ` +
+      `Bring the rig up in that profile first: ` +
+      `node tests/e2e/live/fleet-registry/rig.mjs up --profile ${process.env.PROFILE}`,
+  );
+}
+
+/**
+ * Membership in this profile is push enrolment, so trust starts off and an
+ * operator grants it. A pull source has no such step: membership of the
+ * directory *is* the authorisation, which is the property the k8s profile
+ * exists to prove, so there is nothing to approve and nothing to pre-seed.
+ */
+const ENROLMENT_ONLY = "enrolment is a push-profile step; k8s discovers";
+const CREDENTIALS_ONLY =
+  "this profile distributes no keys, so there is no credential to inject";
 
 test.describe.configure({ mode: "serial" });
 
@@ -53,10 +100,33 @@ test.describe.configure({ mode: "serial" });
 
 const masterAuth = { "X-Session-API-Key": rig.keys.master };
 
+/**
+ * Retries a request once when the *transport* fails, never when the server
+ * answers.
+ *
+ * In the k8s profile the only way in is a `kubectl port-forward`, and it drops
+ * an individual connection from time to time — the listener stays up and the
+ * next request succeeds. That is a property of the viewer's tunnel, not an
+ * answer from the registry, and an unattended run should not fail on it. An
+ * HTTP status is never retried: that is the thing under test.
+ */
+async function throughTheTunnel<T>(attempt: () => Promise<T>): Promise<T> {
+  try {
+    return await attempt();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/socket hang up|ECONNRESET|ECONNREFUSED|EPIPE/i.test(message)) {
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    return attempt();
+  }
+}
+
 async function listEntries(request: APIRequestContext): Promise<RigEntry[]> {
-  const response = await request.get(`${rig.baseUrl}/api/registry`, {
-    headers: masterAuth,
-  });
+  const response = await throughTheTunnel(() =>
+    request.get(`${rig.baseUrl}/api/registry`, { headers: masterAuth }),
+  );
   expect(response.status(), "the registry must answer a keyed read").toBe(200);
   return (await response.json()).entries as RigEntry[];
 }
@@ -72,15 +142,29 @@ function entryNamed(entries: RigEntry[], name: string): RigEntry {
  * the caller. That absence is the whole point: whatever reaches the node has
  * to have been put there by the ingress.
  */
+/**
+ * A path that a working entry answers 200 on, in this profile.
+ *
+ * The tailnet profile places a credential for each node out of band, so an
+ * authenticated route is the stronger probe: a 200 there is only explicable by
+ * the proxy having injected the node's own key. The k8s profile distributes no
+ * keys at all — membership of the namespace is the whole of the trust — so the
+ * same route correctly answers 401 and the honest liveness probe is the
+ * unauthenticated one the discovery source itself uses.
+ */
+const LIVENESS_PATH = TAILNET ? "/api/conversations/search" : "/server_info";
+
 async function proxyStatus(
   request: APIRequestContext,
   entryId: string,
-  path_ = "/api/conversations/search",
+  path_ = LIVENESS_PATH,
   headers: Record<string, string> = masterAuth,
 ): Promise<number> {
-  const response = await request.get(
-    `${rig.baseUrl}/backend/${entryId}${path_}`,
-    { headers, failOnStatusCode: false },
+  const response = await throughTheTunnel(() =>
+    request.get(`${rig.baseUrl}/backend/${entryId}${path_}`, {
+      headers,
+      failOnStatusCode: false,
+    }),
   );
   return response.status();
 }
@@ -102,18 +186,20 @@ const SKIP_ONBOARDING = () => {
  * master shows it on a fresh browser regardless of what localStorage says.
  */
 test.beforeAll(async ({ request }) => {
-  const response = await request.patch(
-    `http://127.0.0.1:${rig.ports.masterAgentServer}/api/settings`,
-    {
-      headers: masterAuth,
-      data: {
-        misc_settings_diff: {
-          app_preferences: { user_consents_to_analytics: false },
-        },
+  // Through the front door, not at the agent server directly: in the k8s
+  // profile the agent server is inside the cluster and this machine has no
+  // route to it at all. `/api` is in the front door's route table in both
+  // profiles, which is the whole reason the registry defaults to storing
+  // itself there.
+  const response = await request.patch(`${rig.baseUrl}/api/settings`, {
+    headers: masterAuth,
+    data: {
+      misc_settings_diff: {
+        app_preferences: { user_consents_to_analytics: false },
       },
-      failOnStatusCode: false,
     },
-  );
+    failOnStatusCode: false,
+  });
   expect(response.ok(), "could not silence the consent modal").toBe(true);
 });
 
@@ -150,9 +236,20 @@ async function dismissConsentModal(page: Page): Promise<void> {
 async function openSwitcher(page: Page) {
   await page.getByTestId("backend-selector").hover();
   const options = page.locator("li");
-  await expect(
-    options.filter({ hasText: MANUAL_BACKEND_NAME }).first(),
-  ).toBeVisible({ timeout: 15_000 });
+  // Anchored on the manual entry where the launcher seeds one, and otherwise
+  // on the list being populated at all. Never on a fleet row: the callers
+  // assert about those, including their absence after a revocation, so
+  // waiting for one would make this helper wait for the very thing a test is
+  // proving has gone.
+  const manual = options.filter({ hasText: MANUAL_BACKEND_NAME }).first();
+  await expect
+    .poll(
+      async () =>
+        (await manual.isVisible().catch(() => false)) ||
+        (await options.count()) > 0,
+      { timeout: 15_000, message: "the backend switcher never populated" },
+    )
+    .toBe(true);
   return options;
 }
 
@@ -172,31 +269,20 @@ async function shot(page: Page, name: string): Promise<string> {
 }
 
 /**
- * Re-runs `agent-canvas enrol` for node 2. Node 1's re-enrolment is driven
- * over SSH from the rig, since only that machine holds its host key.
+ * Re-runs enrolment for a node, from that node.
+ *
+ * Both nodes are real machines now, and only the machine holding a host key
+ * can sign for itself, so a re-registration has to originate there. The spec
+ * shells out to the rig rather than growing SSH knowledge of its own.
  */
-function reEnrolNode2(): string {
-  return execFileSync(
+function reEnrol(which: "node1" | "node2"): string {
+  const output = execFileSync(
     "node",
-    [
-      "bin/enrol.mjs",
-      "--registry",
-      rig.baseUrl,
-      "--name",
-      NODE2,
-      "--host",
-      rig.node2Url,
-      "--secret-provider",
-      "file",
-      "--secret",
-      rig.keys.node2,
-      "--generate-key",
-    ],
-    {
-      encoding: "utf8",
-      env: { ...process.env, HOME: path.join(rig.dir, "home") },
-    },
-  ).trim();
+    ["tests/e2e/live/fleet-registry/rig.mjs", `reenrol-${which}`],
+    { encoding: "utf8" },
+  );
+  const match = output.match(/^(pending|active|stale|revoked) \S+$/m);
+  return match ? match[0] : output.trim();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -207,10 +293,21 @@ test("the rig starts from the state this spec is written against", async ({
   request,
 }) => {
   const entries = await listEntries(request);
+  const observed = entries
+    .map((entry) => `${entry.name}=${entry.state}`)
+    .sort();
+  const expected = TAILNET
+    ? // One machine is pre-seeded and one is not, which is the whole of the
+      // trust decision this profile exercises.
+      [`${NODE1}=active`, `${NODE2}=pending`]
+    : // Membership of the namespace is the authorisation, so nothing is ever
+      // pending: a discovered Service is active as soon as it answers.
+      [`${NODE1}=active`, `${NODE2}=active`];
+
   expect(
-    entries.map((entry) => `${entry.name}=${entry.state}`).sort(),
-    "re-run `node tests/e2e/live/fleet-registry/rig.mjs up` before this spec",
-  ).toEqual([`${NODE1}=active`, `${NODE2}=pending`]);
+    observed,
+    `re-run \`node tests/e2e/live/fleet-registry/rig.mjs up --profile ${PROFILE}\` before this spec`,
+  ).toEqual(expected.sort());
 });
 
 test("reads and approvals need the master key; registration does not", async ({
@@ -223,11 +320,13 @@ test("reads and approvals need the master key; registration does not", async ({
   expect(anonymous.status()).toBe(401);
 
   // A node's own key is a credential for that node, never for the fleet.
-  const withNodeKey = await request.get(`${rig.baseUrl}/api/registry`, {
-    headers: { "X-Session-API-Key": rig.keys.node1 },
-    failOnStatusCode: false,
-  });
-  expect(withNodeKey.status()).toBe(401);
+  if (TAILNET) {
+    const withNodeKey = await request.get(`${rig.baseUrl}/api/registry`, {
+      headers: { "X-Session-API-Key": rig.keys.node1 as string },
+      failOnStatusCode: false,
+    });
+    expect(withNodeKey.status()).toBe(401);
+  }
 
   expect(
     (
@@ -239,6 +338,8 @@ test("reads and approvals need the master key; registration does not", async ({
 test("a pre-seeded fingerprint enrols active, an unknown one lands pending", async ({
   request,
 }) => {
+  test.skip(!TAILNET, ENROLMENT_ONLY);
+
   // @spec FR-005
   const entries = await listEntries(request);
   expect(entries).toHaveLength(2);
@@ -268,6 +369,8 @@ test("a pre-seeded fingerprint enrols active, an unknown one lands pending", asy
 test("a pending entry is listed in the switcher but refuses selection", async ({
   page,
 }) => {
+  test.skip(!TAILNET, ENROLMENT_ONLY);
+
   // @spec FR-012
   await openCanvas(page);
   const options = await openSwitcher(page);
@@ -286,6 +389,8 @@ test("a pending entry is listed in the switcher but refuses selection", async ({
 test("Manage Backends shows provenance and offers approve, not delete", async ({
   page,
 }) => {
+  test.skip(!TAILNET, ENROLMENT_ONLY);
+
   // @spec FR-013 FR-014
   await openCanvas(page);
   await openManageBackends(page);
@@ -329,6 +434,8 @@ test("approving from the UI makes the entry connectable", async ({
   page,
   request,
 }) => {
+  test.skip(!TAILNET, ENROLMENT_ONLY);
+
   // @spec FR-020
   expect(
     await proxyStatus(request, rig.entries.node2.id),
@@ -378,10 +485,24 @@ test("the browser holds no fleet credential and sends none", async ({
   // Drive real traffic at both entries so the assertion has something to bite
   // on: health probes for the fleet rows run as soon as the list hydrates.
   await openManageBackends(page);
-  await expect(page.getByTestId(`manage-backends-status-${NODE1}`)).toHaveText(
-    "Connected",
-    { timeout: 30_000 },
-  );
+  await expect
+    .poll(() => proxied.length, {
+      timeout: 30_000,
+      message: "no browser request reached the proxy to inspect",
+    })
+    .toBeGreaterThan(0);
+
+  if (TAILNET) {
+    // A credential was placed for this entry out of band, so the row reports a
+    // working connection. In the k8s profile no key is distributed at all, and
+    // the row says so — "Disconnected (check API key)" is the honest answer for
+    // a machine the fleet can list and reach but not authenticate to. What is
+    // asserted below holds either way: whatever the browser sent, it was the
+    // master's key and never a node's.
+    await expect(
+      page.getByTestId(`manage-backends-status-${NODE1}`),
+    ).toHaveText("Connected", { timeout: 30_000 });
+  }
 
   const storage = await page.evaluate(() => {
     const dump = (store: Storage) =>
@@ -395,12 +516,18 @@ test("the browser holds no fleet credential and sends none", async ({
     storage.length,
     "storage should not be empty for this to mean anything",
   ).toBeGreaterThan(0);
-  expect(storage, `${NODE1}'s session key reached the browser`).not.toContain(
-    rig.keys.node1,
-  );
-  expect(storage, `${NODE2}'s session key reached the browser`).not.toContain(
-    rig.keys.node2,
-  );
+  // Only the tailnet profile has node keys to leak. In k8s no key is
+  // distributed at all, so the assertion below would pass against `undefined`
+  // and prove nothing; what is still asserted in both is that every browser
+  // request carries the master's key and no other.
+  for (const which of ["node1", "node2"] as const) {
+    const nodeKey = rig.keys[which];
+    if (!nodeKey) continue;
+    expect(
+      storage,
+      `${rig.entries[which].name}'s session key reached the browser`,
+    ).not.toContain(nodeKey);
+  }
   // A hydrated entry carries *this origin's* key, which the browser is
   // entitled to and which the ingress requires before it will proxy at all.
   // What it must never carry is a node's own key.
@@ -414,12 +541,10 @@ test("the browser holds no fleet credential and sends none", async ({
   expect(fleet.every((backend) => backend.apiKey === rig.keys.master)).toBe(
     true,
   );
-  expect(
-    fleet.some(
-      (backend) =>
-        backend.apiKey === rig.keys.node1 || backend.apiKey === rig.keys.node2,
-    ),
-  ).toBe(false);
+  const nodeKeys = [rig.keys.node1, rig.keys.node2].filter(Boolean);
+  expect(fleet.some((backend) => nodeKeys.includes(backend.apiKey))).toBe(
+    false,
+  );
 
   expect(
     proxied.length,
@@ -436,11 +561,12 @@ test("the browser holds no fleet credential and sends none", async ({
     expect(sent, `${where} reached the proxy unauthenticated`).toBe(
       rig.keys.master,
     );
-    expect(sent, `${where} carried ${NODE1}'s key`).not.toBe(rig.keys.node1);
-    expect(sent, `${where} carried ${NODE2}'s key`).not.toBe(rig.keys.node2);
-    expect(request.url(), `${where} carried a key in the URL`).not.toContain(
-      rig.keys.node1,
-    );
+    for (const nodeKey of nodeKeys) {
+      expect(sent, `${where} carried a node's own key`).not.toBe(nodeKey);
+      expect(request.url(), `${where} carried a key in the URL`).not.toContain(
+        nodeKey,
+      );
+    }
   }
   console.log(
     `evidence: ${proxied.length} browser requests to /backend/*, every one ` +
@@ -451,6 +577,8 @@ test("the browser holds no fleet credential and sends none", async ({
 test("the proxy injects each entry's own credential, and only its own", async ({
   request,
 }) => {
+  test.skip(!TAILNET, CREDENTIALS_ONLY);
+
   // @spec FR-019
   // The differential is the proof. Same method, same path, same absence of a
   // credential: 200 through the proxy, 401 straight at the node. The only
@@ -459,13 +587,16 @@ test("the proxy injects each entry's own credential, and only its own", async ({
   expect(await proxyStatus(request, rig.entries.node1.id)).toBe(200);
   expect(await proxyStatus(request, rig.entries.node2.id)).toBe(200);
 
-  const direct = async (url: string, key?: string) =>
-    (
-      await request.get(`${url}/api/conversations/search`, {
-        headers: key ? { "X-Session-API-Key": key } : {},
-        failOnStatusCode: false,
-      })
-    ).status();
+  // Node's `fetch`, not Playwright's request context: the nodes are addressed
+  // by MagicDNS name, which this Mac's system resolver refuses and
+  // `./magicdns.mjs` fixes in this process. Playwright's context resolves in
+  // the driver, where that patch does not reach.
+  const direct = async (url: string, key?: string) => {
+    const response = await fetch(`${url}/api/conversations/search`, {
+      headers: key ? { "X-Session-API-Key": key } : {},
+    });
+    return response.status;
+  };
 
   expect(await direct(rig.node1Url), "node 1 is genuinely protected").toBe(401);
   expect(await direct(rig.node2Url), "node 2 is genuinely protected").toBe(401);
@@ -513,16 +644,16 @@ test("the proxy refuses a caller it cannot authenticate", async ({
   ).toBe(401);
 
   // A node's own key authorises that node, never a caller of the fleet.
-  expect(
-    await proxyStatus(
-      request,
-      rig.entries.node1.id,
-      "/api/conversations/search",
-      {
-        "X-Session-API-Key": rig.keys.node1,
-      },
-    ),
-  ).toBe(401);
+  if (TAILNET) {
+    expect(
+      await proxyStatus(
+        request,
+        rig.entries.node1.id,
+        "/api/conversations/search",
+        { "X-Session-API-Key": rig.keys.node1 as string },
+      ),
+    ).toBe(401);
+  }
 
   // An unauthenticated caller cannot even learn which entry ids exist.
   expect(
@@ -603,6 +734,11 @@ test("a browser that has never seen the fleet renders it anyway", async ({
 test("a conversation runs on the remote node through the proxy", async ({
   request,
 }) => {
+  test.skip(
+    !TAILNET,
+    "`claude`/ACP is not installed in-cluster, so no model turn can run there",
+  );
+
   const proxied = `${rig.baseUrl}/backend/${rig.entries.node1.id}`;
 
   // The remote node's own settings drive the agent; the request carries no
@@ -736,6 +872,60 @@ test("a conversation runs on the remote node through the proxy", async ({
           `proven: ${events.length} events were written on the remote host.`,
   );
 
+  // The event socket, through the same proxy, for the same conversation.
+  //
+  // Everything above is HTTP. The canvas watches a conversation over
+  // `/sockets/events/<id>`, which is an upgrade — a separate path through the
+  // proxy, with its own credential injection and its own access-log record —
+  // and the wire record is only complete if that hop appears in it too. A
+  // WebSocket cannot carry a header from a browser, so the session key rides
+  // in the query, which is exactly why the access log redacts it.
+  const socketUrl = `${rig.baseUrl.replace(/^http/, "ws")}/backend/${
+    rig.entries.node1.id
+  }/sockets/events/${conversation.id}?session_api_key=${encodeURIComponent(
+    rig.keys.master,
+  )}`;
+  const upgraded = await new Promise<boolean>((resolve) => {
+    const socket = new WebSocket(socketUrl);
+    const settle = (value: boolean) => {
+      try {
+        socket.close();
+      } catch {
+        // already closing
+      }
+      resolve(value);
+    };
+    socket.addEventListener("open", () => settle(true));
+    socket.addEventListener("error", () => settle(false));
+    setTimeout(() => settle(false), 20_000);
+  });
+  expect(upgraded, "the event socket never upgraded through the proxy").toBe(
+    true,
+  );
+
+  // The proxy records what the node answered, so a 101 here is the node
+  // accepting the socket, not the master reporting that it dialled.
+  await expect
+    .poll(
+      () =>
+        readFileSync(rig.accessLogPath, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line))
+          .some(
+            (entry) =>
+              entry.kind === "upgrade" &&
+              entry.outcome === "proxied:101" &&
+              entry.entryFingerprint === rig.node1Fingerprint &&
+              entry.credential === "injected",
+          ),
+      { timeout: 20_000, message: "no proxied:101 line for the event socket" },
+    )
+    .toBe(true);
+  console.log(
+    `evidence: proxied:101 against ${rig.node1Fingerprint}, credential injected`,
+  );
+
   await request.delete(`${proxied}/api/conversations/${conversation.id}`, {
     headers: masterAuth,
     failOnStatusCode: false,
@@ -749,17 +939,17 @@ test("a conversation runs on the remote node through the proxy", async ({
 test("re-enrolling updates in place and never escalates trust", async ({
   request,
 }) => {
+  test.skip(!TAILNET, ENROLMENT_ONLY);
+
   // @spec FR-006 FR-007
   const before = await listEntries(request);
   expect(before).toHaveLength(2);
 
-  execFileSync("node", [
-    "tests/e2e/live/fleet-registry/rig.mjs",
-    "reenrol-node1",
-  ]);
-  // `enrol` also prints where the session key must live, so the state line is
-  // matched rather than assumed to be first.
-  expect(reEnrolNode2()).toMatch(/^active \S+$/m);
+  // Both nodes re-register from themselves. `enrol` also prints where the
+  // session key must live, so the state line is matched rather than assumed
+  // to be first.
+  expect(reEnrol("node1")).toMatch(/^active \S+$/);
+  expect(reEnrol("node2")).toMatch(/^active \S+$/);
 
   const after = await listEntries(request);
   expect(after, "re-enrolment must never add a second entry").toHaveLength(2);
@@ -769,6 +959,285 @@ test("re-enrolling updates in place and never escalates trust", async ({
   // approval has to survive its own re-registration.
   expect(entryNamed(after, NODE2).state).toBe("active");
   expect(entryNamed(after, NODE1).state).toBe("active");
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Profile k8s — the enterprise case: membership comes from the cluster
+//
+// Placed before the revocation section because this file is serial and those
+// tests revoke an entry; a stale or revoked entry would make everything here
+// assert about a fleet that is already being dismantled.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * `kubectl` against the rig's own kubeconfig. The cluster is reached the way
+ * any platform engineer reaches one — not over the overlay, which is the
+ * point of this profile.
+ */
+function kubectl(...args: string[]): string {
+  return execFileSync(
+    "kubectl",
+    [
+      "--kubeconfig",
+      rig.kubeconfig as string,
+      "-n",
+      rig.namespace as string,
+      ...args,
+    ],
+    { encoding: "utf8" },
+  ).trim();
+}
+
+/** Waits out at most two poll cycles for the registry to catch up. */
+async function pollForEntries(
+  request: APIRequestContext,
+  predicate: (entries: RigEntry[]) => boolean,
+  what: string,
+) {
+  await expect
+    .poll(async () => predicate(await listEntries(request)), {
+      timeout: (rig.sourceIntervalMs ?? 60_000) * 3,
+      message: what,
+    })
+    .toBe(true);
+}
+
+test("the cluster's Service list is the fleet, with nothing enrolled", async ({
+  request,
+}) => {
+  test.skip(!K8S, "there is no cluster in the tailnet profile");
+
+  const entries = await listEntries(request);
+  expect(entries.length).toBeGreaterThanOrEqual(2);
+
+  for (const entry of entries) {
+    // Discovered, not enrolled: the source says so, and so does the absence of
+    // everything enrolment produces.
+    expect(entry.source, `${entry.name} did not come from the cluster`).toBe(
+      "k8s",
+    );
+    // Membership of the namespace is the authorisation, so there is no
+    // pending state to clear and no operator decision to wait for.
+    expect(entry.state).toBe("active");
+    // No key was distributed, so there is no reference to one.
+    expect(entry.credRef).toBeNull();
+    // The identity is the Service's namespaced name, prefixed so it can never
+    // collide with an SSH fingerprint from signed enrolment.
+    expect(entry.fingerprint).toMatch(
+      new RegExp(`^k8s:${rig.namespace}/[a-z0-9-]+$`),
+    );
+    // Addressed by cluster DNS. Not a tunnel, not an overlay address, not a
+    // loopback port: the name the registry resolves from inside the cluster.
+    expect(entry.host).toMatch(
+      new RegExp(
+        `^http://[a-z0-9-]+\\.${rig.namespace}\\.svc\\.cluster\\.local:\\d+$`,
+      ),
+    );
+  }
+
+  // One entry per pool member, each individually addressable. An aggregate
+  // Service in front of all of them would list one endpoint where the cluster
+  // has several machines, and answer a conversation lookup from whichever it
+  // picked.
+  const services = kubectl(
+    "get",
+    "svc",
+    "-l",
+    "app.kubernetes.io/name=agent-server",
+    "-o",
+    "jsonpath={.items[*].metadata.name}",
+  )
+    .split(/\s+/)
+    .filter(Boolean);
+  expect(entries.map((entry) => entry.name).sort()).toEqual(services.sort());
+});
+
+test("a discovered entry is reachable through the in-cluster master", async ({
+  request,
+}) => {
+  test.skip(!K8S, "there is no cluster in the tailnet profile");
+
+  // The viewer's only path in is the rig's port-forward, and from there the
+  // master proxies to cluster DNS. Nothing on this machine can resolve
+  // `.svc.cluster.local`, so a 200 here is the in-cluster hop, not this one.
+  for (const entry of await listEntries(request)) {
+    expect(
+      await proxyStatus(request, entry.id, "/server_info"),
+      `${entry.host} was not reachable from inside the cluster`,
+    ).toBe(200);
+  }
+});
+
+test("scaling the pool changes the fleet within one poll, with nothing enrolled", async ({
+  request,
+}) => {
+  test.skip(!K8S, "there is no cluster in the tailnet profile");
+  test.setTimeout(600_000);
+
+  const before = await listEntries(request);
+  const release = rig.releases?.pool as string;
+
+  // `kubectl scale` moves pods, not Services, and a pool member is a Service
+  // — one per member, because members are not interchangeable. So the scale
+  // that changes the fleet is the chart's own replica count.
+  execFileSync(
+    "helm",
+    [
+      "--kubeconfig",
+      rig.kubeconfig as string,
+      "upgrade",
+      release,
+      "helm/agent-canvas",
+      "-n",
+      rig.namespace as string,
+      "--reuse-values",
+      "--set",
+      "agentPool.replicas=3",
+      "--wait",
+      "--timeout",
+      "10m",
+    ],
+    { encoding: "utf8" },
+  );
+
+  await pollForEntries(
+    request,
+    (entries) =>
+      entries.filter((e) => e.state === "active").length === before.length + 1,
+    "the new pool member never reached the registry",
+  );
+
+  const after = await listEntries(request);
+  const added = after.filter(
+    (entry) => !before.some((existing) => existing.id === entry.id),
+  );
+  expect(added).toHaveLength(1);
+  // Nothing was enrolled, no key was distributed, no fingerprint pre-seeded:
+  // the machine joined the fleet by existing in the namespace.
+  expect(added[0].source).toBe("k8s");
+  expect(added[0].credRef).toBeNull();
+  expect(added[0].state).toBe("active");
+  expect(await proxyStatus(request, added[0].id, "/server_info")).toBe(200);
+
+  console.log(
+    `the fleet grew to ${after.length} with no enrolment: ${added[0].name}`,
+  );
+});
+
+test("a deleted Service goes stale rather than being forgotten", async ({
+  request,
+}) => {
+  test.skip(!K8S, "there is no cluster in the tailnet profile");
+  test.setTimeout(300_000);
+
+  // @spec FR-023
+  const entries = await listEntries(request);
+  const victim = entries[entries.length - 1];
+
+  kubectl("delete", "svc", victim.name);
+
+  await pollForEntries(
+    request,
+    (current) =>
+      current.find((entry) => entry.id === victim.id)?.state === "stale",
+    `${victim.name} never went stale`,
+  );
+
+  const after = await listEntries(request);
+  const same = after.find((entry) => entry.id === victim.id);
+  // Deleting rather than staling would also drop an operator's revocation of
+  // that machine, and a machine missing from one listing is usually a blip.
+  expect(same, "the entry was deleted instead of staled").toBeDefined();
+  expect(same?.state).toBe("stale");
+  expect(after).toHaveLength(entries.length);
+});
+
+test("the registry keeps listing after the ServiceAccount token rotates", async ({
+  request,
+}) => {
+  test.skip(!K8S, "there is no cluster in the tailnet profile");
+  // The kubelet rewrites a projected token at about 80% of its life, and the
+  // rig asks for the shortest expiry the TokenRequest API allows, so the
+  // rotation lands around eight minutes in.
+  test.setTimeout(20 * 60_000);
+
+  // A process that reads the token once at boot starts getting 401s when it
+  // rotates and never recovers, and the source loop swallows the error — the
+  // registry simply stops listing with nothing in the logs to say why. This
+  // waits for a real rotation, performed by the kubelet, rather than faking
+  // one: a fake proves the test, not the mechanism.
+  const pod = kubectl(
+    "get",
+    "pod",
+    "-l",
+    `app.kubernetes.io/instance=${rig.releases?.canvas}`,
+    "-o",
+    "jsonpath={.items[0].metadata.name}",
+  );
+  const readToken = () =>
+    kubectl(
+      "exec",
+      pod,
+      "--",
+      "cat",
+      "/var/run/secrets/kubernetes.io/serviceaccount/token",
+    );
+
+  const before = readToken();
+  expect(before.length, "the pod has no ServiceAccount token").toBeGreaterThan(
+    0,
+  );
+
+  await expect
+    .poll(() => readToken() !== before, {
+      timeout: 15 * 60_000,
+      intervals: [30_000],
+      message: "the kubelet never rotated the projected token",
+    })
+    .toBe(true);
+  console.log(`the kubelet rotated ${pod}'s ServiceAccount token`);
+
+  // The assertion: a full fleet is still listed after the source has had to
+  // read credentials again, and it is still reachable.
+  const entries = await listEntries(request);
+  const active = entries.filter((entry) => entry.state === "active");
+  expect(
+    active.length,
+    "the registry stopped listing after the token rotated",
+  ).toBeGreaterThan(0);
+  expect(await proxyStatus(request, active[0].id, "/server_info")).toBe(200);
+
+  // And nothing in the pod's log says the source failed a cycle — including
+  // the TLS failure the CA dispatcher exists to prevent, asserted here
+  // against a real API server rather than a stub fetch.
+  const logs = execFileSync(
+    "kubectl",
+    [
+      "--kubeconfig",
+      rig.kubeconfig as string,
+      "-n",
+      rig.namespace as string,
+      "logs",
+      pod,
+      "--tail=1000",
+    ],
+    { encoding: "utf8" },
+  );
+  for (const signature of [
+    "unable to verify the first certificate",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "certificate has expired",
+    "self-signed certificate",
+  ]) {
+    expect(logs, `the pod logged a TLS failure: ${signature}`).not.toContain(
+      signature,
+    );
+  }
+  expect(logs, "the source loop reported a failed cycle").not.toContain(
+    "[registry:k8s] sync failed",
+  );
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -809,11 +1278,10 @@ test("revoking one node 403s its path and leaves the other working", async ({
 });
 
 test("a revoked node stays revoked when it re-enrols", async ({ request }) => {
+  test.skip(!TAILNET, ENROLMENT_ONLY);
+
   // @spec FR-007
-  execFileSync("node", [
-    "tests/e2e/live/fleet-registry/rig.mjs",
-    "reenrol-node1",
-  ]);
+  reEnrol("node1");
   const entries = await listEntries(request);
   expect(entries).toHaveLength(2);
   expect(

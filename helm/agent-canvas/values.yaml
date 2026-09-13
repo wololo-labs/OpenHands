@@ -173,6 +173,11 @@ registry:
   # by the discovery sources below have no credential reference, so this is the
   # difference between listing a machine and granting access to it.
   allowUncredentialed: false
+  # How often a pull source re-reads its directory, in seconds. The default
+  # suits a fleet that changes by the hour; shorten it when a scale-up should
+  # reach the switcher sooner, at the cost of one API-server list per member
+  # per interval.
+  sourceIntervalSeconds: 60
   sources:
     kubernetes:
       # List Services labelled app.kubernetes.io/name=agent-server in this

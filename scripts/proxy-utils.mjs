@@ -61,9 +61,27 @@ function writeInvalidBackendUrlResponse(req, res) {
   }
 }
 
+/**
+ * The pathname of an inbound request, or `null` if the request line is not
+ * something WHATWG will parse.
+ *
+ * Every caller of this runs inside a server's request listener, where a throw
+ * is caught by nothing and takes the whole process down. Node's HTTP parser
+ * accepts request lines the URL parser rejects — `GET //[` is enough — and
+ * those arrive before any authentication, so an unauthenticated peer must not
+ * be able to reach a bare `new URL`. Callers treat `null` as "not mine" and
+ * let the request fall through to the route table, which answers 404.
+ */
+export function requestPathname(req) {
+  try {
+    return new URL(req?.url ?? "/", "http://localhost").pathname;
+  } catch {
+    return null;
+  }
+}
+
 export function isServerInfoRequest(req) {
-  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
-  return pathname === SERVER_INFO_PATH;
+  return requestPathname(req) === SERVER_INFO_PATH;
 }
 
 export function proxyServerInfoRequest(
