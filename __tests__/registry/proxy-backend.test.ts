@@ -297,6 +297,12 @@ describe("backend proxy", () => {
       "openhands/hetzner/session-key",
       "fleet-key",
     );
+    // A credential the node will reject: the proxy still injects one, and the
+    // node still answers, which is the case the access log has to distinguish.
+    await createFileSecretProvider({ root: secretsRoot }).put(
+      "openhands/hetzner/wrong-key",
+      "not-the-fleet-key",
+    );
   });
 
   afterAll(async () => {
@@ -672,7 +678,7 @@ describe("backend proxy", () => {
           entryName: "hetzner",
           entryFingerprint: "SHA256:node-fpr",
           credential: "injected",
-          outcome: "proxied",
+          outcome: "proxied:200",
         }),
       ]);
     });
@@ -694,7 +700,7 @@ describe("backend proxy", () => {
           conversationId: "conv-77",
           entryFingerprint: "SHA256:node-fpr",
           credential: "injected",
-          outcome: "proxied",
+          outcome: "proxied:101",
         }),
       ]);
     });
@@ -710,6 +716,62 @@ describe("backend proxy", () => {
           error: "not_active",
           entryId: null,
           credential: "none",
+        }),
+      ]);
+    });
+
+    /**
+     * The line the chain verifier reads as "the node answered this" must not
+     * be written for a request the node rejected. Anyone holding the master
+     * key can address `/conversations/<any id>` at a real node; what stops
+     * that minting evidence is the node's own status landing in the record.
+     */
+    it("records the status the node answered with, not that a dial was made", async () => {
+      await mountLogged([
+        activeEntry({ credRef: "openhands/hetzner/wrong-key" }),
+      ]);
+
+      const response = await callerFetch(
+        `${base}/backend/abc123/api/conversations/never-happened/events/search`,
+      );
+
+      expect(response.status).toBe(401);
+      expect(await lines()).toEqual([
+        expect.objectContaining({
+          conversationId: "never-happened",
+          credential: "injected",
+          outcome: "proxied:401",
+        }),
+      ]);
+    });
+
+    it("records a transport failure as the gateway error it produced", async () => {
+      await mountLogged([activeEntry()]);
+      await close(backend.server);
+
+      const response = await callerFetch(`${base}/backend/abc123/api/settings`);
+
+      expect(response.status).toBe(502);
+      expect(await lines()).toEqual([
+        expect.objectContaining({ outcome: "proxied:502" }),
+      ]);
+    });
+
+    it("records an upgrade the node refused with the node's own status", async () => {
+      await mountLogged([activeEntry()]);
+      // The fake node accepts every upgrade, so refusal is produced by taking
+      // it away: an upgrade that never reaches a node is not evidence either.
+      await close(backend.server);
+
+      await handshake(
+        `${base}/backend/abc123/sockets/events/conv-77?session_api_key=${MASTER_KEY}`,
+      );
+
+      expect(await lines()).toEqual([
+        expect.objectContaining({
+          kind: "upgrade",
+          conversationId: "conv-77",
+          outcome: "upstream_error",
         }),
       ]);
     });

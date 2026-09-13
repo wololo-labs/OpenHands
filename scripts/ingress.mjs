@@ -266,6 +266,15 @@ function buildRegistryConfig(args, env, routes, defaultBackend) {
   const sessionKey =
     args.registrySessionKey || env.REGISTRY_SESSION_KEY || null;
   if (!sessionKey) {
+    // An operator who asked for the wire record and silently got no file
+    // believes there is evidence where there is none, which is worse than
+    // having asked for nothing.
+    if (args.registryAccessLog || env.REGISTRY_ACCESS_LOG) {
+      console.warn(
+        "[ingress] --registry-access-log was given but the registry is off " +
+          "(no --registry-session-key): nothing will be logged.",
+      );
+    }
     return null;
   }
 

@@ -62,6 +62,14 @@ const NODE1 = {
   stagingDir:
     process.env.FLEET_RIG_NODE1_STAGING_DIR ??
     "/home/claude/.cache/agent-canvas-enrol-rig",
+  // Commit signing, checked before a run rather than after it. The
+  // fingerprint is the one published in the run's anchor comment.
+  signingKeyPath:
+    process.env.FLEET_RIG_NODE1_SIGNING_KEY_PATH ??
+    "/home/claude/.ssh/fleet-node-signing.pub",
+  signingKeyFingerprint:
+    process.env.FLEET_RIG_NODE1_SIGNING_FINGERPRINT ??
+    "SHA256:H5ez7DvuU+IhNEzHK8eELNf5520yO+ZWGn/TR8gEQmE",
 };
 const NODE2_NAME = "local-node-2";
 const AGENT_SERVER_VERSION = JSON.parse(
@@ -110,6 +118,49 @@ function ssh(remoteCommand, { timeout = 60_000 } = {}) {
  * works. Only the enrolment half is copied; nothing installed on the node is
  * touched.
  */
+/**
+ * The node still signs commits with its own key.
+ *
+ * Link 1 of `scripts/verify-fleet-chain.mjs` is the only one that tells the
+ * node apart from this Mac, and it holds only while the node signs with a key
+ * this machine does not have. That config has silently reverted to the shared
+ * OpenPGP key once already, and the verifier catches it after the work is
+ * done -- one ssh round trip here costs a second, the same discovery at
+ * verification time costs the run. Set `FLEET_RIG_SKIP_SIGNING_CHECK` for a
+ * rig run that is not driving commits.
+ */
+function checkNode1Signing() {
+  if (process.env.FLEET_RIG_SKIP_SIGNING_CHECK) return;
+
+  const format = ssh("git config --global --get gpg.format || true").trim();
+  const fingerprint = ssh(
+    `ssh-keygen -lf ${NODE1.signingKeyPath} 2>/dev/null | cut -d' ' -f2 || true`,
+  ).trim();
+  const signing = ssh(
+    "git config --global --get user.signingkey || true",
+  ).trim();
+
+  const problems = [];
+  if (format !== "ssh") problems.push(`gpg.format is "${format}", not "ssh"`);
+  if (signing !== NODE1.signingKeyPath) {
+    problems.push(
+      `user.signingkey is "${signing}", not ${NODE1.signingKeyPath}`,
+    );
+  }
+  if (fingerprint !== NODE1.signingKeyFingerprint) {
+    problems.push(
+      `${NODE1.signingKeyPath} is ${fingerprint || "unreadable"}, not the published ${NODE1.signingKeyFingerprint}`,
+    );
+  }
+  if (problems.length > 0) {
+    throw new Error(
+      `${NODE1.name}: commits from this node would not prove it made them: ` +
+        `${problems.join("; ")}. Fix the node's signing config before the run.`,
+    );
+  }
+  log(`node1 signs with ${NODE1.signingKeyFingerprint}`);
+}
+
 function stageNode1() {
   const files = [
     "bin/enrol.mjs",
@@ -357,6 +408,8 @@ async function up() {
     );
   }
   log(`ports ${JSON.stringify(state.ports)}`);
+
+  checkNode1Signing();
 
   state.evidenceDir = path.join(dir, "evidence");
   state.accessLogPath = path.join(state.evidenceDir, "proxy-access.jsonl");
