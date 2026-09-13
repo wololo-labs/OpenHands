@@ -46,13 +46,13 @@ node scripts/ingress.mjs \
   --registry-preseed "SHA256:8NeiIgzltMXycwvv3RnvRhfFAVAiqHx+kkUgfMYO2iA"
 ```
 
-| Flag                         | Environment variable       | Meaning                                                                |
-| ---------------------------- | -------------------------- | ---------------------------------------------------------------------- |
-| `--registry-session-key`     | `REGISTRY_SESSION_KEY`     | Enables the registry and authenticates its read and approval routes    |
-| `--registry-agent-server`    | `REGISTRY_AGENT_SERVER`    | Where entries are stored (defaults to whichever backend serves `/api`) |
-| `--registry-preseed`         | `REGISTRY_PRESEED`         | Fingerprints that enrol straight to `active`                           |
-| `--registry-secret-provider` | `REGISTRY_SECRET_PROVIDER` | Resolves a fleet backend's key when proxying (`file`, `op`)            |
-| `--registry-allow-uncredentialed` | `REGISTRY_ALLOW_UNCREDENTIALED` | Proxy entries that carry no credential reference (off by default) |
+| Flag                              | Environment variable            | Meaning                                                                |
+| --------------------------------- | ------------------------------- | ---------------------------------------------------------------------- |
+| `--registry-session-key`          | `REGISTRY_SESSION_KEY`          | Enables the registry and authenticates its read and approval routes    |
+| `--registry-agent-server`         | `REGISTRY_AGENT_SERVER`         | Where entries are stored (defaults to whichever backend serves `/api`) |
+| `--registry-preseed`              | `REGISTRY_PRESEED`              | Fingerprints that enrol straight to `active`                           |
+| `--registry-secret-provider`      | `REGISTRY_SECRET_PROVIDER`      | Resolves a fleet backend's key when proxying (`file`, `op`)            |
+| `--registry-allow-uncredentialed` | `REGISTRY_ALLOW_UNCREDENTIALED` | Proxy entries that carry no credential reference (off by default)      |
 
 Entries live in the agent server's `misc_settings.fleet_backends`, so there is
 no second datastore to operate and they survive a restart.
@@ -63,16 +63,16 @@ A signature proves **possession**, never **authorisation**. A node proves it
 holds its own SSH host key; whether that node may be reached is a separate
 decision:
 
-| Situation                                        | Outcome                                              |
-| ------------------------------------------------ | ---------------------------------------------------- |
-| Fingerprint pre-seeded before the node registers | `active`, connectable immediately                    |
-| Fingerprint not pre-seeded                       | `pending`, listed but not connectable until approved |
-| Entry revoked, then the node re-registers        | Stays `revoked`; re-registering never restores trust |
-| Entry approved, then un-seeded                   | Stays `active`; the approval already happened        |
+| Situation                                        | Outcome                                                 |
+| ------------------------------------------------ | ------------------------------------------------------- |
+| Fingerprint pre-seeded before the node registers | `active`, connectable immediately                       |
+| Fingerprint not pre-seeded                       | `pending`, listed but not connectable until approved    |
+| Entry revoked, then the node re-registers        | Stays `revoked`; re-registering never restores trust    |
+| Entry approved, then un-seeded                   | Stays `active`; the approval already happened           |
 | Hand-approved entry re-registers on a new host   | Back to `pending`; the address was part of the approval |
-| Entry deleted with `DELETE /api/registry/:id`    | Forgotten entirely; revoke keeps it, delete does not  |
-| Pre-seeded entry re-registers on a new host      | Stays `active`; the fingerprint is what was trusted   |
-| A source stops reporting a discovered machine    | `stale`, not deleted, so a revocation is never lost  |
+| Entry deleted with `DELETE /api/registry/:id`    | Forgotten entirely; revoke keeps it, delete does not    |
+| Pre-seeded entry re-registers on a new host      | Stays `active`; the fingerprint is what was trusted     |
+| A source stops reporting a discovered machine    | `stale`, not deleted, so a revocation is never lost     |
 
 Reads and approvals need the session key. Registration is the one route that
 does not, because a freshly provisioned node holds its own host key and none of
@@ -137,12 +137,12 @@ a name and a host, never a secret reference), then re-register to repoint
 `host`. Deriving the reference removes the choice, and with it the whole class
 of attack -- there is no reference a node can name but does not own.
 
-`host` stays updatable, which is safe *because* the reference is derived:
+`host` stays updatable, which is safe _because_ the reference is derived:
 repointing an entry yields only the credential of the machine whose host key
 signed the registration.
 
 Moving is not free, though. An entry approved by hand goes back to `pending`
-when its host changes, because an approval is of a machine *at an address* and
+when its host changes, because an approval is of a machine _at an address_ and
 that address was part of what the operator saw. Otherwise an approved entry
 could quietly repoint the master at somewhere nobody agreed to -- a link-local
 metadata address, say -- and wait for the next person to select it. A
@@ -357,6 +357,79 @@ the fleet sees nothing until it is back.
 The path requires reachability in both directions: the node reaches the master
 to register, and the master reaches the node to probe and to proxy.
 
+## Recording the wire, and verifying against it
+
+`--registry-access-log <file>` (or `REGISTRY_ACCESS_LOG`) appends one JSON line
+per `/backend/:id/*` request. Off unless given. Each line names the entry that
+was reached, its SSH fingerprint, the conversation id, and whether a credential
+was injected; a request the proxy refused is recorded too, with its status,
+because "the node was never reached" is a claim the record has to be able to
+settle.
+
+`outcome` is the node's own answer, not the master's intent: `proxied:<status>`
+once the response completed (`proxied:101` for an accepted event socket),
+`refused:<status>` for a request the proxy itself turned away, `upstream_error`
+for an upgrade that never reached the node. That distinction is load-bearing.
+The conversation id is read from the caller's path, so anyone holding the
+master key can address `/backend/<node>/api/conversations/<any id>` at a real
+node and produce a line naming a conversation in which nothing ever ran. What
+stops that being evidence is the node's own status landing in the record: it
+404s, and the verifier does not count it. A log written before `outcome`
+carried a status (a bare `proxied`) verifies as broken rather than as proof.
+
+The caller's session key is deleted from the URL before anything is written. A
+browser cannot set a header on a WebSocket handshake, so the SDK passes the key
+as a query parameter, and the inbound URL of every upgrade therefore carries a
+live fleet credential. Redaction is by shape rather than by one parameter name:
+anything matching `key|token|secret|auth|password|session|cred` goes, and the
+fragment is dropped.
+
+`scripts/verify-fleet-chain.mjs` reads that log back. It holds every commit in a
+range to four links, and exits 0 only if all of them hold for all of them:
+
+| Link      | What it checks                                                                                                                                                                                                                               |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| signature | a good SSH signature from a key generated on the node. The only link that covers `git push`, which is not proxy-observable                                                                                                                   |
+| trailers  | `Fleet-Conversation` and `Fleet-Run`, the nonce matching the one published before the work started                                                                                                                                           |
+| proxy     | that conversation in the access log, answered by the node (`proxied:101/2xx/3xx`), credential injected, against the node's fingerprint, before the commit, with the tunnel map agreeing that the loopback port forwards to that same machine |
+| events    | an agent-sourced event in that conversation naming the commit's subject                                                                                                                                                                      |
+
+Two properties are what make it worth running rather than reading. The key is
+pinned by `--signing-key-fingerprint`, which is meant to come from the run's
+published issue: a verifier pointed at a key the running machine chose proves
+only that the files that machine holds agree with each other. And commits CI
+pushed are exempt only when named by sha with `--exempt`, never on the strength
+of an author or committer name, which are strings anyone can set.
+
+Exit codes distinguish the two failures: 1 is a broken chain, 2 is a check that
+could not be run.
+
+## Which deployments are supported
+
+An entry is a URL plus a credential reference, and the proxy dials that URL.
+Nothing in the registry knows what a tunnel is, so what a deployment has to
+answer is how a node becomes **dialable**.
+
+| Profile | How the node is reached | Membership | Status |
+|---|---|---|---|
+| **A — in-cluster** | `http://<svc>.<ns>.svc.cluster.local:<port>` | Services labelled `app.kubernetes.io/name=agent-server` | **supported**, proven against a real cluster |
+| **B — private overlay** | `https://<node>.<tailnet>:8443` over tailscale or wireguard | push enrolment signed by the node's SSH host key | **supported**, proven against two real VMs |
+| **C — cloud edge** | a public ingress with mutual TLS | push enrolment | needs no registry code; not attempted, because it needs an ingress controller and certificates |
+| **D — egress-only** | *nothing: the node has no inbound path* | — | **not supported.** See "Reachability profiles" in `specs/fleet-registry.md` |
+
+Profile D is the honest gap. A node that can only make outbound connections —
+a laptop behind NAT, a VPC with no ingress, a network that permits outbound 443
+and nothing else — cannot be served by any of the above, because every one of
+them ends in the master dialling the node. Supporting it means inverting the
+direction of the connection and running a stateful relay that holds one channel
+per node, which is the property every profile here avoids by design. It is
+specified and deferred, not quietly missing.
+
+SSH is not a transport in any profile. Where this documentation and the live
+rig use it, it is provisioning: installing k3s, or running the enrolment client
+on the machine that holds the host key, because only that machine can sign for
+itself.
+
 ## Validating against real machines
 
 Every other registry test in this repository uses a fake. The live rig runs the
@@ -364,10 +437,38 @@ whole loop against real agent servers, one of them on another host, enrolled
 with that host's own SSH key:
 
 ```bash
-node tests/e2e/live/fleet-registry/rig.mjs up      # stand it up and enrol both nodes
-npm run test:e2e:fleet-registry                    # enrol -> pending -> approve -> proxy -> revoke
-node tests/e2e/live/fleet-registry/rig.mjs down    # kill by recorded PID, drop secrets, clear entries
+# Profile B: two real VMs on the overlay
+node tests/e2e/live/fleet-registry/rig.mjs up --profile tailnet
+PROFILE=tailnet npm run test:e2e:fleet-registry
+node tests/e2e/live/fleet-registry/rig.mjs down
+
+# Profile A: a real k3s cluster, installed from nothing and removed again
+node tests/e2e/live/fleet-registry/rig.mjs up --profile k8s
+PROFILE=k8s npm run test:e2e:fleet-registry
+node tests/e2e/live/fleet-registry/rig.mjs down
 ```
+
+One spec, two profiles: reachability is the only difference, which is the
+claim. Profile-specific assertions say in their skip reason why they cannot be
+made in the other profile, so a gate is never silent. The spec reads the
+profile from the rig's own state file rather than from the environment —
+`PROFILE=k8s` against a tailnet rig is refused rather than skipping the
+assertions that apply and running the ones that cannot.
+
+Proving the suite can fail is a separate, standing job:
+
+```bash
+# permanent: negative controls and forgery attempts, run with every suite
+#   tests/e2e/live/fleet-registry/falsification.spec.ts
+
+# on demand: revert each gating fix, watch a NAMED assertion go red, restore
+node tests/e2e/live/fleet-registry/deliberate-breakage.mjs
+```
+
+The k8s profile installs k3s on the target VM and uninstalls it again on
+teardown, so every run pays for install-from-nothing. It reaches the canvas
+only through a rig-managed `kubectl port-forward`: that profile exists to prove
+no overlay is needed, so it does not get to use one.
 
 The rig is deliberately hermetic: random ports in 39000-39999, a state
 directory under `$TMPDIR/fleet-rig-<ts>`, and `HOME` pointed inside it so the
@@ -381,10 +482,14 @@ says so if it finds anything else. Re-run `up` before re-running the spec: the
 never de-escalates trust.
 
 The conversation assertion is the one that needs the remote node to be able to
-run a model at all. It launches from the node's own active agent profile, which
-is how the canvas starts a conversation and the only shape that reaches an ACP
-agent: an inline `agent_settings` dump loses the ACP fields and the server falls
-back to the LLM agent. What it asserts is that the agent *acted* -- an
+run a model at all. It launches from the node's own active agent profile,
+because that is how the canvas starts a conversation and it is known to reach
+an ACP agent. An earlier version of this paragraph also claimed that an inline
+`agent_settings` dump loses the ACP fields and the server falls back to the LLM
+agent. That claim is **withdrawn**: it was never isolated from a broken event
+poll in the same test, and the poll was the defect. Use the profile because it
+works, not because the dump is known to fail. What it asserts is that the agent
+_acted_ -- an
 `ActionEvent` from the agent -- rather than the absence of one error code. A
 node with no usable model credential stops at `LLMAuthenticationError`, which
 still proves every hop up to the model call and is accepted as the degraded
@@ -415,12 +520,21 @@ no resolver for it are the common case), the fix is a resolver entry:
 printf 'nameserver 100.100.100.100\n' | sudo tee /etc/resolver/ts.net
 ```
 
-Where that is not available, forward the node's port instead and register the
-forwarded address as the entry's host:
+Where that is not available either — an unattended run has no way to become
+root — resolution can be supplied to the master process alone. The live rig
+does this: `tests/e2e/live/fleet-registry/magicdns.mjs`, loaded with
+`node --import`, asks `100.100.100.100` for `*.ts.net` and hands everything
+else to the OS. It is rig-only and nothing in `scripts/` knows it exists; on a
+host whose resolver works it returns exactly what `getaddrinfo` would have.
+
+The last resort, if even that is unavailable, is to forward the node's port and
+register the forwarded address as the entry's host:
 
 ```bash
 ssh -N -L 127.0.0.1:39165:127.0.0.1:8000 claude@100.125.222.64
 ```
 
-The hop still runs over the tailnet; only name resolution moves. This is what
-the live rig does, so it does not depend on the operator's DNS.
+The hop still runs over the tailnet; only name resolution moves. It costs the
+certificate check, though — a loopback port proves nothing about which machine
+answered — so an entry registered that way needs a tunnel map alongside it for
+any evidence to mean anything. Prefer the resolver.

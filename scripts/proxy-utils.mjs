@@ -61,9 +61,27 @@ function writeInvalidBackendUrlResponse(req, res) {
   }
 }
 
+/**
+ * The pathname of an inbound request, or `null` if the request line is not
+ * something WHATWG will parse.
+ *
+ * Every caller of this runs inside a server's request listener, where a throw
+ * is caught by nothing and takes the whole process down. Node's HTTP parser
+ * accepts request lines the URL parser rejects — `GET //[` is enough — and
+ * those arrive before any authentication, so an unauthenticated peer must not
+ * be able to reach a bare `new URL`. Callers treat `null` as "not mine" and
+ * let the request fall through to the route table, which answers 404.
+ */
+export function requestPathname(req) {
+  try {
+    return new URL(req?.url ?? "/", "http://localhost").pathname;
+  } catch {
+    return null;
+  }
+}
+
 export function isServerInfoRequest(req) {
-  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
-  return pathname === SERVER_INFO_PATH;
+  return requestPathname(req) === SERVER_INFO_PATH;
 }
 
 export function proxyServerInfoRequest(
@@ -280,7 +298,39 @@ export function createProxyHandlers({
     }
   }
 
-  function proxyWebSocket(req, socket, head, target) {
+  /**
+   * The upstream status of one upgrade, reported once.
+   *
+   * httpxy exposes the upstream request for an upgrade only through a
+   * server-wide event, so the listener finds its own request by identity and
+   * then takes itself off again. Without this an upgrade the node refused and
+   * one it accepted are indistinguishable to a caller.
+   */
+  function watchUpgradeStatus(req, socket, onUpstreamStatus) {
+    const report = once(onUpstreamStatus);
+    const listener = (proxyReq, incoming) => {
+      if (incoming !== req) return;
+      proxy.off("proxyReqWs", listener);
+      proxyReq.once("upgrade", () => report(101));
+      proxyReq.once("response", (proxyRes) => report(proxyRes.statusCode));
+      proxyReq.once("error", () => report(null));
+    };
+    proxy.on("proxyReqWs", listener);
+    // The event never fires if the upgrade dies before the request is made.
+    socket.once("close", () => {
+      proxy.off("proxyReqWs", listener);
+      report(null);
+    });
+  }
+
+  function proxyWebSocket(
+    req,
+    socket,
+    head,
+    target,
+    { onUpstreamStatus } = {},
+  ) {
+    if (onUpstreamStatus) watchUpgradeStatus(req, socket, onUpstreamStatus);
     metrics.activeWebSockets += 1;
     metrics.totalWebSockets += 1;
     const finish = once(() => {

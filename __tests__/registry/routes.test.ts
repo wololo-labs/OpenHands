@@ -133,6 +133,26 @@ describe("isRegistryRequest", () => {
   ])("%s -> %s", (url, expected) => {
     expect(isRegistryRequest({ url })).toBe(expected);
   });
+
+  /**
+   * Node's HTTP parser accepts every one of these request lines. The check
+   * runs in the ingress request listener before any auth, so a throw here is
+   * an unauthenticated remote kill of the whole master.
+   *
+   * `//[` and `//%` are the ones WHATWG refuses outright — an invalid host in
+   * a protocol-relative URL. The `%`-in-path cases parse fine and really are
+   * registry paths; they are here because they look like the same bug and
+   * must not be "fixed" into a 404.
+   */
+  it.each([
+    ["//[", false],
+    ["//%", false],
+    ["/api/registry/%", true],
+    ["/api/registry/%zz", true],
+  ])("%s is answered, not thrown on (-> %s)", (url, expected) => {
+    expect(() => isRegistryRequest({ url })).not.toThrow();
+    expect(isRegistryRequest({ url })).toBe(expected);
+  });
 });
 
 describe("registry routes", () => {

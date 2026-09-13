@@ -121,8 +121,15 @@ RUN if [ -n "${AGENT_SERVER_SDK_GIT_REF}" ]; then \
 COPY --from=frontend-build /build/build /opt/agent-canvas/frontend
 
 # Copy the static-server scripts and their production runtime deps.
+# The registry tree comes with them: in this image static-server is the front
+# door the browser talks to, so `registry.enabled` in the helm chart is served
+# from here. Leaving it out is how the chart came to set REGISTRY_* env vars
+# that nothing in the container read.
 COPY scripts/static-server.mjs /opt/agent-canvas/static-server.mjs
 COPY scripts/proxy-utils.mjs /opt/agent-canvas/proxy-utils.mjs
+COPY scripts/proxy-backend.mjs /opt/agent-canvas/proxy-backend.mjs
+COPY scripts/registry/ /opt/agent-canvas/registry/
+COPY --from=frontend-build /build/node_modules/undici /opt/agent-canvas/node_modules/undici
 COPY --from=frontend-build /build/node_modules/httpxy /opt/agent-canvas/node_modules/httpxy
 COPY --from=frontend-build /build/node_modules/sirv /opt/agent-canvas/node_modules/sirv
 COPY --from=frontend-build /build/node_modules/@polka /opt/agent-canvas/node_modules/@polka

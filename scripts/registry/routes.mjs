@@ -14,6 +14,7 @@
  * provisioned node has its own host key but none of the master's credentials.
  */
 
+import { requestPathname } from "../proxy-utils.mjs";
 import { createEnrolment } from "./enrolment.mjs";
 import { createInlineProvider } from "./providers/inline.mjs";
 import { secretMatches } from "./session-key.mjs";
@@ -25,7 +26,10 @@ const SESSION_KEY_HEADER = "x-session-api-key";
 const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
 
 export function isRegistryRequest(req) {
-  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+  // Guarded, because this runs in the ingress request listener before any
+  // auth: an unparseable request line must answer "not mine", not throw.
+  const pathname = requestPathname(req);
+  if (pathname === null) return false;
   return (
     pathname === REGISTRY_PREFIX || pathname.startsWith(`${REGISTRY_PREFIX}/`)
   );

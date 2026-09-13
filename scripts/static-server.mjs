@@ -41,6 +41,11 @@ import {
   matchesPathPrefix,
   proxyServerInfoRequest,
 } from "./proxy-utils.mjs";
+import {
+  buildRegistryConfig,
+  mountRegistry,
+  parseFingerprintList,
+} from "./registry/mount.mjs";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SPA fallback helpers
@@ -99,6 +104,16 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
     vscodeBasePath: null,
     // Also settable via the --disable-telemetry flag below.
     disableTelemetry: isEnvFlagEnabled(env.AGENT_CANVAS_DISABLE_TELEMETRY),
+    registry: {
+      sessionKey: null,
+      agentServerUrl: null,
+      preseed: [],
+      secretProvider: null,
+      allowUncredentialed: false,
+      accessLog: null,
+      sources: [],
+      sourceIntervalMs: null,
+    },
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -154,6 +169,30 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
         break;
       }
 
+      case "--registry-session-key":
+        config.registry.sessionKey = argv[++i] || null;
+        break;
+      case "--registry-agent-server":
+        config.registry.agentServerUrl = argv[++i] || null;
+        break;
+      case "--registry-preseed":
+        config.registry.preseed.push(...parseFingerprintList(argv[++i]));
+        break;
+      case "--registry-secret-provider":
+        config.registry.secretProvider = argv[++i] || null;
+        break;
+      case "--registry-allow-uncredentialed":
+        config.registry.allowUncredentialed = true;
+        break;
+      case "--registry-access-log":
+        config.registry.accessLog = argv[++i] || null;
+        break;
+      case "--registry-source":
+        config.registry.sources.push(argv[++i]);
+        break;
+      case "--registry-source-interval":
+        config.registry.sourceIntervalMs = Number(argv[++i]) || null;
+        break;
       case "--auth-required":
         config.authRequired = true;
         break;
@@ -216,6 +255,14 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
     process.exit(1);
   }
 
+  // Resolved here rather than in startStaticServer so a misconfigured
+  // registry fails at startup, with the flags still in hand to name.
+  config.registry = buildRegistryConfig(
+    config.registry,
+    env,
+    createRouter(config.routes),
+  );
+
   return config;
 }
 
@@ -252,6 +299,29 @@ OPTIONS:
                                frontend can populate the agent's
                                <RUNTIME_SERVICES> system-prompt block without
                                VITE_RUNTIME_SERVICES_INFO baked in.
+  --registry-session-key <k>   Enable the fleet registry on /api/registry/*
+                               and the credential-injecting /backend/:id proxy,
+                               and require <k> on their read/approval routes.
+                               Off unless given. Also REGISTRY_SESSION_KEY.
+  --registry-agent-server <u>  Agent server storing the registry (defaults to
+                               the backend serving /api)
+  --registry-preseed <fprs>    SSH fingerprints that enrol straight to
+                               "active" (comma or space separated, repeatable)
+  --registry-secret-provider <name>
+                               Secret provider used to resolve a fleet
+                               backend's session key when proxying (file, op)
+  --registry-allow-uncredentialed
+                               Proxy fleet entries that carry no credential
+                               reference. Off by default: such an entry is
+                               relayed to with no credential at all.
+  --registry-access-log <f>    Append one JSON line per /backend/:id request
+                               to <f>. Off unless given.
+  --registry-source <name>     Populate the registry from a directory that
+                               already knows the fleet (k8s, tailnet).
+                               Repeatable.
+  --registry-source-interval <ms>
+                               How often a pull source re-reads its directory
+                               (default: 60000)
   --lock-to-cloud <cloud-url>  Lock backend setup to a single OpenHands Cloud
                                URL. Hides manual/local backend setup and the
                                custom Cloud URL field in the pre-built frontend.
@@ -637,6 +707,10 @@ async function handleStatic(
 export function startStaticServer(config) {
   const route = createRouter(config.routes);
   const proxy = createProxyHandlers({ label: `static:${config.port}` });
+  // The same fleet registry `scripts/ingress.mjs` mounts. In the container the
+  // helm chart deploys, this process is the front door the browser talks to,
+  // so this is where /api/registry and /backend/:id have to live.
+  const registry = mountRegistry(config.registry ?? null, { proxy });
   const dirAbs = resolve(config.dir);
   const injectionOpts = {
     sessionApiKey: config.sessionApiKey || null,
@@ -656,6 +730,9 @@ export function startStaticServer(config) {
 
   const server = createServer((req, res) => {
     const url = req.url ?? "/";
+
+    if (registry?.handle(req, res)) return;
+
     const backend = route(url);
     if (backend) {
       // The editor is advertised as `<origin><prefix>/?tkn=<token>`, and that
@@ -694,6 +771,8 @@ export function startStaticServer(config) {
   });
 
   server.on("upgrade", (req, socket, head) => {
+    if (registry?.handleUpgrade(req, socket, head)) return;
+
     const backend = route(req.url ?? "/");
     if (backend) {
       proxy.proxyWebSocket(req, socket, head, backend);
@@ -701,7 +780,10 @@ export function startStaticServer(config) {
     }
     socket.destroy();
   });
-  server.on("close", uninstallDiagnostics);
+  server.on("close", () => {
+    uninstallDiagnostics();
+    registry?.stop();
+  });
 
   return new Promise((resolveListen) => {
     server.listen(config.port, config.host, () => {

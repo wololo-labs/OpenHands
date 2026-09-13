@@ -34,5 +34,21 @@ export default defineConfig({
     trace: "retain-on-failure",
     video: "off",
   },
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  // Two ordered projects rather than alphabetical luck. Both files are
+  // stateful against one live fleet — the registry's loop under test *is* a
+  // state machine — and falsification revokes entries, so it has to run after
+  // the assertions that need them active. `dependencies` says that out loud.
+  projects: [
+    {
+      name: "fleet",
+      testMatch: /fleet-registry\.spec\.ts/,
+      use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      name: "falsification",
+      testMatch: /falsification\.spec\.ts/,
+      dependencies: ["fleet"],
+      use: { ...devices["Desktop Chrome"] },
+    },
+  ],
 });

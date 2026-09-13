@@ -100,4 +100,67 @@ describe.skipIf(!(await hasHelm()))("agent-canvas chart", () => {
       );
     }
   });
+
+  /**
+   * One labelled Service per pool member, not one in front of all of them.
+   * Members keep their own conversations on their own PVC, so a Service that
+   * load-balanced across them would answer a conversation lookup from
+   * whichever member it happened to pick — and the switcher would list one
+   * endpoint where there are three machines.
+   */
+  it("gives every pool member its own discoverable Service", async () => {
+    const rendered = await render([
+      "agentPool.enabled=true",
+      "agentPool.replicas=3",
+    ]);
+
+    const discoverable = rendered
+      .split("---")
+      .filter(
+        (doc) =>
+          doc.includes("kind: Service") &&
+          doc.includes("app.kubernetes.io/name: agent-server"),
+      );
+
+    expect(discoverable).toHaveLength(3);
+    for (const [index, doc] of discoverable.entries()) {
+      expect(doc).toContain(`name: t-agent-canvas-${index}`);
+      // Resolves to exactly one member, by the label the StatefulSet
+      // controller sets on every pod it owns.
+      expect(doc).toContain(
+        `statefulset.kubernetes.io/pod-name: t-agent-canvas-${index}`,
+      );
+    }
+  });
+
+  it("does not label the aggregate Service, which fronts every member at once", async () => {
+    const rendered = await render([
+      "agentPool.enabled=true",
+      "agentPool.replicas=2",
+    ]);
+
+    const aggregate = rendered
+      .split("---")
+      .find(
+        (doc) =>
+          doc.includes("kind: Service") &&
+          doc.includes("name: t-agent-canvas\n") &&
+          !doc.includes("headless"),
+      );
+
+    expect(aggregate).toBeDefined();
+    expect(aggregate).not.toContain("app.kubernetes.io/name: agent-server");
+  });
+
+  it("carries the source poll interval into the pod, in milliseconds", async () => {
+    const rendered = await render([
+      "registry.enabled=true",
+      "registry.sources.kubernetes.enabled=true",
+      "registry.sourceIntervalSeconds=5",
+      "secrets.sessionApiKey.existingSecret=fleet-session-key",
+    ]);
+
+    expect(rendered).toContain("REGISTRY_SOURCE_INTERVAL_MS");
+    expect(rendered).toContain('value: "5000"');
+  });
 });

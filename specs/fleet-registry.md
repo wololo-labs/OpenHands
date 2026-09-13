@@ -234,6 +234,93 @@ in `docs/fleet-registry-plan.md`. Entries land as each phase ships.
 
 ---
 
+## Reachability profiles
+
+Everything above assumes a node the master can **dial**. Nothing in the
+registry, the proxy or the canvas knows what a tunnel is: an entry is a URL
+plus a credential reference, and the proxy dials whatever URL the entry
+carries. So the real question a deployment answers is not which tunnel, but
+how a machine becomes dialable at all.
+
+```
+              ┌──────────────────────────────────────────────┐
+              │ registry entry = { host: URL, credRef, fpr }  │
+              └───────────────────────┬──────────────────────┘
+                                      │ proxy dials host
+   ┌──────────────────┬───────────────┴───────────┬────────────────────┐
+   ▼                  ▼                           ▼                    ▼
+ PROFILE A          PROFILE B                  PROFILE C            PROFILE D
+ in-cluster         private overlay            cloud edge           egress-only
+ svc.cluster.local  ts.net / wireguard         ingress + mTLS       node has NO
+ pull source        push enrolment             push enrolment       inbound path
+ no enrolment       no ssh, no tunnel          no ssh               ── NOT BUILT ──
+ PROVEN             PROVEN                     not attempted        specified only
+```
+
+A and B are proven end to end by one profile-parameterised live spec,
+`tests/e2e/live/fleet-registry/fleet-registry.spec.ts`, run twice. C needs an
+ingress controller and certificates and is simply not attempted yet; it needs
+no new registry code, only a deployment that has those things.
+
+D is different in kind, and is the subject of the next section.
+
+### FR-025: A node with no inbound path is not supported, and says so
+
+- [ ] **Deferred.** A node that can only make outbound connections -- a laptop
+      behind NAT, a hardened VPC with no ingress, a customer network that
+      permits outbound 443 and nothing else -- cannot be served by any profile
+      above, because every one of them ends in the master dialling the node.
+      The honest answer today is "not supported", and the documentation says so
+      rather than implying a tunnel would fix it.
+
+**What it would require.** The direction of the connection inverts: the node
+opens and holds a channel to the master, and the master proxies *through the
+held channel* rather than dialling an address.
+
+```
+   supported today                      what D would need
+   ┌────────┐   dial   ┌──────┐         ┌────────┐  holds   ┌───────┐  dial  ┌──────┐
+   │ master │ ───────▶ │ node │         │ master │ ◀─────── │ relay │ ◀───── │ node │
+   └────────┘          └──────┘         └────────┘  splice  └───────┘ outbound└──────┘
+   entry.host is an address              entry.host is a channel id
+```
+
+**What it changes in this spec.** Three things that are currently simple stop
+being so:
+
+- `normaliseHost` (`scripts/registry/store.mjs`) accepts any `http:`/`https:`
+  origin because an entry's host is an address. A channel id is not a URL, so
+  either the field changes shape or a `relay:` scheme is invented and every
+  consumer learns it.
+- the proxy's dial path (`scripts/proxy-backend.mjs`) opens a socket to the
+  entry's host. It would instead have to find the node's held channel and
+  multiplex a request onto it, including WebSocket upgrades.
+- liveness stops being a `/server_info` probe and becomes "is the channel
+  still held", which is a different question with a different failure mode: a
+  channel can be held by a node that is wedged.
+
+**What it costs.** A stateful component with per-node connection state, on the
+master or beside it. Every profile above avoids this by design -- the master
+holds no connection to a node between requests, so it can restart, scale to
+several replicas, or be replaced without a node noticing. A relay gives that
+up: it is the one piece that cannot be stateless, and it becomes the thing
+that is paged for.
+
+**Prior art, as a bound on the design.** Orca ships exactly this shape for
+phones -- two outbound WebSockets spliced by a relay cell -- and refuses it for
+machine control: *"relay v1 is mobile-only; accepting it on runtime offers
+would imply routing and credential support that client does not have."* That
+is a team that built the thing declining to point it at this problem, which is
+worth more than an argument from first principles.
+
+**The decision.** Deferred, not rejected. What would force it is a customer
+whose nodes cannot be dialled from anywhere the master can run -- at which
+point the work is the relay, its state, and its operational burden, and not
+anything in the registry, whose contract is already indifferent to how a host
+became reachable.
+
+---
+
 ## Deferred
 
 Raised in review, deliberately not fixed here. Recorded so it is not

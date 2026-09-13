@@ -1,6 +1,6 @@
 import { createServer, request as httpRequest, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -25,6 +25,7 @@ import {
   isBackendProxyRequest,
   parseBackendProxyUrl,
 } from "../../scripts/proxy-backend.mjs";
+import { createAccessLog } from "../../scripts/registry/access-log.mjs";
 import { createFileSecretProvider } from "../../scripts/registry/secrets/file.mjs";
 
 type Entry = Record<string, unknown> & { id: string; state: string };
@@ -240,7 +241,9 @@ describe("applyCredentialToPath", () => {
   it("removes the caller's key from the query string", () => {
     const search = new URLSearchParams("limit=5&session_api_key=callers-key");
 
-    expect(applyCredentialToPath("/api/x", search, null)).toBe("/api/x?limit=5");
+    expect(applyCredentialToPath("/api/x", search, null)).toBe(
+      "/api/x?limit=5",
+    );
   });
 
   it("keeps the credential out of an ordinary request's URL", () => {
@@ -293,6 +296,12 @@ describe("backend proxy", () => {
     await createFileSecretProvider({ root: secretsRoot }).put(
       "openhands/hetzner/session-key",
       "fleet-key",
+    );
+    // A credential the node will reject: the proxy still injects one, and the
+    // node still answers, which is the case the access log has to distinguish.
+    await createFileSecretProvider({ root: secretsRoot }).put(
+      "openhands/hetzner/wrong-key",
+      "not-the-fleet-key",
     );
   });
 
@@ -380,9 +389,9 @@ describe("backend proxy", () => {
   it("returns 403 for an entry still pending approval", async () => {
     await mount([activeEntry({ state: "pending" })]);
 
-    expect((await callerFetch(`${base}/backend/abc123/api/settings`)).status).toBe(
-      403,
-    );
+    expect(
+      (await callerFetch(`${base}/backend/abc123/api/settings`)).status,
+    ).toBe(403);
   });
 
   it("returns 404 for an id the registry does not know", async () => {
@@ -577,7 +586,9 @@ describe("backend proxy", () => {
   it("sees a revocation immediately despite caching the entry list", async () => {
     const { store } = await mount([activeEntry()]);
 
-    expect((await callerFetch(`${base}/backend/abc123/api/x`)).status).toBe(200);
+    expect((await callerFetch(`${base}/backend/abc123/api/x`)).status).toBe(
+      200,
+    );
 
     await store.setState("abc123", "revoked");
 
@@ -622,6 +633,164 @@ describe("backend proxy", () => {
     await callerFetch(`${base}/backend/abc123/api/settings`);
 
     expect(resolveIdentity).not.toHaveBeenCalled();
+  });
+
+  describe("access log", () => {
+    let logRoot: string;
+    let logFile: string;
+
+    beforeEach(async () => {
+      logRoot = await mkdtemp(path.join(tmpdir(), "proxy-access-log-"));
+      logFile = path.join(logRoot, "evidence", "proxy-access.jsonl");
+    });
+
+    afterEach(async () => {
+      await rm(logRoot, { recursive: true, force: true });
+    });
+
+    /** The log as the chain verifier will read it: one JSON object per line. */
+    async function lines() {
+      const raw = await readFile(logFile, "utf8").catch(() => "");
+      return raw
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => JSON.parse(line));
+    }
+
+    function mountLogged(entries: Entry[]) {
+      return mount(entries, { accessLog: createAccessLog({ file: logFile }) });
+    }
+
+    it("writes one line per proxied request, naming the entry it reached", async () => {
+      await mountLogged([activeEntry({ fingerprint: "SHA256:node-fpr" })]);
+
+      await callerFetch(
+        `${base}/backend/abc123/api/conversations/conv-77/events/search`,
+      );
+
+      expect(await lines()).toEqual([
+        expect.objectContaining({
+          kind: "http",
+          method: "GET",
+          url: "/backend/abc123/api/conversations/conv-77/events/search",
+          conversationId: "conv-77",
+          entryId: "abc123",
+          entryName: "hetzner",
+          entryFingerprint: "SHA256:node-fpr",
+          credential: "injected",
+          outcome: "proxied:200",
+        }),
+      ]);
+    });
+
+    it("never writes the caller's session key, which an upgrade carries in the URL", async () => {
+      await mountLogged([activeEntry({ fingerprint: "SHA256:node-fpr" })]);
+
+      await handshake(
+        `${base}/backend/abc123/sockets/events/conv-77?session_api_key=${MASTER_KEY}&latest_event_id=-1`,
+      );
+
+      const raw = await readFile(logFile, "utf8");
+      expect(raw).not.toContain(MASTER_KEY);
+      expect(raw).not.toContain("fleet-key");
+      expect(await lines()).toEqual([
+        expect.objectContaining({
+          kind: "upgrade",
+          url: "/backend/abc123/sockets/events/conv-77?latest_event_id=-1",
+          conversationId: "conv-77",
+          entryFingerprint: "SHA256:node-fpr",
+          credential: "injected",
+          outcome: "proxied:101",
+        }),
+      ]);
+    });
+
+    it("records a refusal, because 'the node was never reached' is a claim too", async () => {
+      await mountLogged([activeEntry({ state: "revoked" })]);
+
+      await callerFetch(`${base}/backend/abc123/api/settings`);
+
+      expect(await lines()).toEqual([
+        expect.objectContaining({
+          outcome: "refused:403",
+          error: "not_active",
+          entryId: null,
+          credential: "none",
+        }),
+      ]);
+    });
+
+    /**
+     * The line the chain verifier reads as "the node answered this" must not
+     * be written for a request the node rejected. Anyone holding the master
+     * key can address `/conversations/<any id>` at a real node; what stops
+     * that minting evidence is the node's own status landing in the record.
+     */
+    it("records the status the node answered with, not that a dial was made", async () => {
+      await mountLogged([
+        activeEntry({ credRef: "openhands/hetzner/wrong-key" }),
+      ]);
+
+      const response = await callerFetch(
+        `${base}/backend/abc123/api/conversations/never-happened/events/search`,
+      );
+
+      expect(response.status).toBe(401);
+      expect(await lines()).toEqual([
+        expect.objectContaining({
+          conversationId: "never-happened",
+          credential: "injected",
+          outcome: "proxied:401",
+        }),
+      ]);
+    });
+
+    it("records a transport failure as the gateway error it produced", async () => {
+      await mountLogged([activeEntry()]);
+      await close(backend.server);
+
+      const response = await callerFetch(`${base}/backend/abc123/api/settings`);
+
+      expect(response.status).toBe(502);
+      expect(await lines()).toEqual([
+        expect.objectContaining({ outcome: "proxied:502" }),
+      ]);
+    });
+
+    it("records an upgrade the node refused with the node's own status", async () => {
+      await mountLogged([activeEntry()]);
+      // The fake node accepts every upgrade, so refusal is produced by taking
+      // it away: an upgrade that never reaches a node is not evidence either.
+      await close(backend.server);
+
+      await handshake(
+        `${base}/backend/abc123/sockets/events/conv-77?session_api_key=${MASTER_KEY}`,
+      );
+
+      expect(await lines()).toEqual([
+        expect.objectContaining({
+          kind: "upgrade",
+          conversationId: "conv-77",
+          outcome: "upstream_error",
+        }),
+      ]);
+    });
+
+    it("keeps proxying when the log file cannot be written", async () => {
+      await mount([activeEntry()], {
+        accessLog: createAccessLog({
+          file: logFile,
+          append: () => {
+            throw new Error("read-only volume");
+          },
+          warn: () => {},
+        }),
+      });
+
+      const response = await callerFetch(`${base}/backend/abc123/api/settings`);
+
+      expect(response.status).toBe(200);
+    });
   });
 });
 

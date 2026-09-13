@@ -1,0 +1,53 @@
+[ingress] 
+[ingress] ╔═══════════════════════════════════════════════════════════════╗
+║  Ingress Proxy                                                ║
+╠═══════════════════════════════════════════════════════════════╣
+║  Listening on: http://localhost:39777/                          ║
+╠═══════════════════════════════════════════════════════════════╣
+║  Routes:                                                      ║
+║      /api → http://127.0.0.1:51338                            ║
+║      /api/registry → http://127.0.0.1:51338                   ║
+║      /backend/:id → fleet (secrets: file)                     ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+
+
+=== 1. canvas reaches the node with a credential it never held ===
+HTTP 200; node saw key=the node's own
+
+=== 2. a websocket upgrade, key in the query where a browser must put it ===
+upgrade completed
+
+=== 3. a revoked entry is refused, and the refusal is recorded ===
+HTTP 403 {"error":"not_active","message":"old-node is revoked, not active"}
+
+=== 4. an unauthenticated caller never reaches the node ===
+HTTP 401
+
+=== the access log at $TMPDIR/phase0-demo-7rb3AC/evidence/proxy-access.jsonl ===
+{"ts":"2026-09-06T23:31:27.929Z","kind":"http","method":"GET","url":"/backend/demo-entry/api/conversations/conv-demo/events/search?limit=5","conversationId":"conv-demo","entryId":"demo-entry","entryName":"claude-hetzner","entryFingerprint":"SHA256:zCJmiJ7wModXHdGhaB0xktp+IBjT0NsgiNJaQtiIMHw","entryHost":"http://127.0.0.1:51337","credential":"injected","outcome":"proxied","error":null}
+{"ts":"2026-09-06T23:31:27.939Z","kind":"upgrade","method":"GET","url":"/backend/demo-entry/sockets/events/conv-demo?latest_event_id=-1","conversationId":"conv-demo","entryId":"demo-entry","entryName":"claude-hetzner","entryFingerprint":"SHA256:zCJmiJ7wModXHdGhaB0xktp+IBjT0NsgiNJaQtiIMHw","entryHost":"http://127.0.0.1:51337","credential":"injected","outcome":"proxied","error":null}
+{"ts":"2026-09-06T23:31:27.943Z","kind":"http","method":"GET","url":"/backend/revoked-entry/api/settings","conversationId":null,"entryId":null,"entryName":null,"entryFingerprint":null,"entryHost":null,"credential":"none","outcome":"refused:403","error":"not_active"}
+{"ts":"2026-09-06T23:31:27.946Z","kind":"http","method":"GET","url":"/backend/demo-entry/api/settings","conversationId":null,"entryId":null,"entryName":null,"entryFingerprint":null,"entryHost":null,"credential":"none","outcome":"refused:401","error":"unauthorized"}
+
+=== credential leak check ===
+master key in log: false
+node key in log:   false
+
+$ npx vitest run __tests__/registry __tests__/scripts
+
+
+ RUN  v4.1.10 /Users/stevengonsalvez/.agents-in-a-box/worktrees/by-name/OpenHands--f-registry-phase1--7ecb84fb
+
+
+ Test Files  27 passed (27)
+      Tests  557 passed (557)
+   Start at  00:29:14
+   Duration  25.28s (transform 4.92s, setup 27.64s, import 3.16s, tests 52.81s, environment 25.03s)
+
+
+$ npm run typecheck
+
+> @openhands/agent-canvas@1.16.0 typecheck
+> react-router typegen && tsc
+
