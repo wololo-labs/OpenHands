@@ -30,7 +30,11 @@ mkdir "$WORK/run"
 NODE_ID=node-1 REPO=acme/widgets ISSUE=9 WORKSPACE_DIR=/srv/widgets MC_SITE_URL=https://mc.example \
   MASTER_URL="http://127.0.0.1:$(cat "$WORK/port")" OUT="$WORK/t.tar.gz" bash "$ROOT/automations/research-phase/make-tarball.sh" >/dev/null
 tar -xzf "$WORK/t.tar.gz" -C "$WORK/run"
-dispatch() { SESSION_API_KEY=master-key AUTOMATION_RUN_ID=run-7 bash "$WORK/run/entrypoint.sh"; }
+dispatch() {
+  SESSION_API_KEY=master-key AUTOMATION_RUN_ID=run-7 \
+    AUTOMATION_CALLBACK_URL="http://127.0.0.1:$(cat "$WORK/port")/callback" bash "$WORK/run/entrypoint.sh"
+}
+callback() { grep 'POST /callback' "$WORK/requests.log" | cut -d' ' -f4-; }
 
 FAILED=0
 check() {
@@ -41,13 +45,17 @@ check() {
 touch "$WORK/node-dead"
 set +e; dispatch 2>"$WORK/err"; code=$?; set -e; rm "$WORK/node-dead"
 check "dead node: fails before anything is started" \
-  "1 GET /backend/node-1/server_info" "$code $(cut -d' ' -f1,2 "$WORK/requests.log")"
+  "1 GET /backend/node-1/server_info" "$code $(grep -v /callback "$WORK/requests.log" | cut -d' ' -f1,2)"
+check "dead node: the run is reported FAILED, so it does not sit RUNNING" \
+  '{"status":"FAILED","run_id":"run-7","error":"entrypoint exited 1"}' "$(callback)"
 check "dead node: says which node and what it answered" "yes" \
   "$(grep -q 'node-1.*502' "$WORK/err" && echo yes || echo no)"
 
 : >"$WORK/requests.log"
 out=$(dispatch)
 check "live node: reports the conversation it started" "run run-7 started conversation conv-1 on node node-1" "$out"
+check "live node: the run is reported COMPLETED with its conversation" \
+  '{"status":"COMPLETED","run_id":"run-7","conversation_id":"conv-1"}' "$(callback)"
 check "live node: every call carries the master key" "master-key" "$(cut -d' ' -f3 "$WORK/requests.log" | sort -u)"
 body=$(grep 'POST /backend/node-1/api/conversations' "$WORK/requests.log" | cut -d' ' -f4-)
 check "request: node profile, dedicated worktree, and a message that runs" \
