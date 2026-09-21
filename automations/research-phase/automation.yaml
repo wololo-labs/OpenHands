@@ -6,11 +6,14 @@
 # site-specific and therefore never committed.
 name: pipeline-research-phase
 entrypoint: bash entrypoint.sh
-# The service requires a trigger. Runs are started by POST /v1/{id}/dispatch;
-# 31 February never arrives, so the schedule never fires.
+# The service requires a trigger. This is the one the pipeline is heading for: a
+# human (or the previous phase) applies the label. It stays inert until the
+# service has a GitHub webhook secret, and until then a run is started with
+# POST /v1/{id}/dispatch.
 trigger:
-  type: cron
-  schedule: "0 0 31 2 *"
+  type: event
+  source: github
+  "on": issues.labeled
+  filter: "label.name == 'phase:research'"
 timeout: 300
 keep_alive: false
-enabled: true
