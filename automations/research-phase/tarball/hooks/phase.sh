@@ -14,6 +14,14 @@
 #
 # Hook processes do not receive conversation secrets, so the two tokens are
 # read from owner-only files on the node.
+#
+# Install this script on the node OUTSIDE any conversation workspace and point
+# the hook command at that absolute path. A hook resolved inside the worktree is
+# a file the agent can edit with a single tool call.
+#
+# Known limit: the agent runs as the same unix user as this hook, so it can
+# still read the token files and the state directory. Closing that needs the
+# hook to run as another user, or the writes to move behind a broker.
 set -euo pipefail
 
 : "${REPO:?}" "${ISSUE:?}" "${RUN_ID:?}" "${MC_SITE_URL:?}"
@@ -28,6 +36,8 @@ GITHUB_API=${GITHUB_API_URL:-https://api.github.com}
 PROJECT_DIR=${OPENHANDS_PROJECT_DIR:-$PWD}
 STATE="$STATE_DIR/$OPENHANDS_SESSION_ID.json"
 SPAN_ID="$PHASE-$OPENHANDS_SESSION_ID"
+SUMMARY_MAX=4000
+TITLE_MAX=200 # mission-control refuses a longer work-unit title
 
 die() { echo "phase.sh: $*" >&2; exit 1; }
 
@@ -43,14 +53,14 @@ read_token() {
 # Tokens go to curl through a config file descriptor, never argv, so they do
 # not show up in the process list the agent can read.
 mc_post() {
-  curl -fsS -m 20 -X POST -K <(printf 'header = "X-WC-Token: %s"\n' "$MC_TOKEN") -H 'content-type: application/json' \
+  curl -fsS -m 15 -X POST -K <(printf 'header = "X-WC-Token: %s"\n' "$MC_TOKEN") -H 'content-type: application/json' \
     -d "$2" "$MC_SITE_URL$1" || die "mission-control rejected POST $1"
 }
 
 gh_api() {
   local method=$1 path=$2
   shift 2
-  curl -fsS -m 20 -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN") \
+  curl -fsS -m 15 -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN") \
     -H 'Accept: application/vnd.github+json' "$@" "$GITHUB_API/repos/$REPO$path"
 }
 
@@ -84,7 +94,7 @@ case "$OPENHANDS_EVENT_TYPE" in
     # processor. Reopening a span that Stop already closed would be a lie.
     [ -f "$STATE" ] && exit 0
     title=$(gh_api GET "/issues/$ISSUE" | jq -er .title) || die "cannot read issue $REPO#$ISSUE"
-    WORK_UNIT_ID=$(mc_post /api/sync/work-unit "$(jq -cn --arg repo "$REPO" --argjson issue "$ISSUE" --arg title "$title" \
+    WORK_UNIT_ID=$(mc_post /api/sync/work-unit "$(jq -cn --arg repo "$REPO" --argjson issue "$ISSUE" --arg title "${title:0:$TITLE_MAX}" \
       '{repo: $repo, issueNumber: $issue, title: $title}')" | jq -er .workUnitId) || die "no workUnitId in response"
     START_MS=$(now_ms)
     phase_event in-progress
@@ -98,42 +108,59 @@ case "$OPENHANDS_EVENT_TYPE" in
     [ -f "$STATE" ] || die "no state for session $OPENHANDS_SESSION_ID: SessionStart never completed"
     WORK_UNIT_ID=$(jq -er .workUnitId "$STATE")
     START_MS=$(jq -er .startMs "$STATE")
-    result="$PROJECT_DIR/.agents/phase-result.json"
-    # No result file, or one that is not the agreed shape, is reported as
-    # blocked. A finished run that forgot the file is a false negative, which is
-    # the safe direction: nothing is recorded as done on the agent's say-so alone.
-    if status=$(jq -er 'select(.status == "done" or .status == "blocked") | .status' "$result" 2>/dev/null); then
-      summary=$(jq -r '.summary // ""' "$result")
-    else
-      status=blocked
-      summary="The agent stopped without writing a valid .agents/phase-result.json."
-    fi
 
-    # endMs is persisted so that a second Stop replays byte-identical bodies:
-    # mission-control answers 200 to an identical receipt and 409 to a changed one.
-    END_MS=$(jq -r '.endMs // empty' "$STATE")
-    if [ -z "$END_MS" ]; then
-      END_MS=$(now_ms)
-      jq -c --argjson endms "$END_MS" '. + {endMs: $endms}' "$STATE" >"$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+    # The outcome is decided once, on the first Stop, and kept in the state
+    # file. A later Stop replays it byte for byte: mission-control answers 200
+    # to an identical receipt and 409 to a changed one, and by then the
+    # worktree may be gone.
+    if [ "$(jq -r '.status // empty' "$STATE")" = "" ]; then
+      result="$PROJECT_DIR/.agents/phase-result.json"
+      # No result file, or one that is not the agreed shape, is reported as
+      # blocked. A finished run that forgot the file is a false negative, which
+      # is the safe direction: nothing is recorded as done on say-so alone.
+      if status=$(jq -er 'select(.status == "done" or .status == "blocked") | .status' "$result" 2>/dev/null); then
+        summary=$(jq -r '.summary // "" | tostring' "$result")
+      else
+        status=blocked
+        summary="The agent stopped without writing a valid .agents/phase-result.json."
+      fi
+      # The summary is written by an agent that read an untrusted issue and can
+      # read this node's token files, and it is about to be posted in public.
+      # Anything credential-shaped withholds the whole summary.
+      if grep -qF -e "$MC_TOKEN" -e "$GH_TOKEN" <<<"$summary" ||
+        grep -qE '(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}' <<<"$summary"; then
+        status=blocked
+        summary="Summary withheld: it contained a credential."
+      fi
+      # Mentions are defused so a summary cannot ping people or teams.
+      summary=$(jq -rn --arg s "${summary:0:$SUMMARY_MAX}" '$s | gsub("@"; "@\u200b")')
+      jq -c --arg status "$status" --arg summary "$summary" --argjson endms "$(now_ms)" \
+        '. + {status: $status, summary: $summary, endMs: $endms}' "$STATE" >"$STATE.tmp" && mv "$STATE.tmp" "$STATE"
     fi
-    phase_event "$status" "$END_MS"
+    status=$(jq -er .status "$STATE")
+    summary=$(jq -r .summary "$STATE")
+    phase_event "$status" "$(jq -er .endMs "$STATE")"
     receipt 2 phase.completed "$(jq -cn --arg c "$OPENHANDS_SESSION_ID" --arg p "$PHASE" --arg s "$status" \
-      --arg sum "${summary:0:4000}" '{conversationId: $c, phase: $p, status: $s, summary: $sum}')"
+      --arg sum "$summary" '{conversationId: $c, phase: $p, status: $s, summary: $sum}')"
 
-    # Mission-control has the record. Only now is GitHub written.
-    [ "$(jq -r '.published // false' "$STATE")" = true ] && exit 0
-    # shellcheck disable=SC2016
-    body=$(printf '### Pipeline phase `%s`: %s\n\n%s\n\n<sub>run `%s` · conversation `%s`</sub>' \
-      "$PHASE" "$status" "${summary:0:60000}" "$RUN_ID" "$OPENHANDS_SESSION_ID")
-    gh_api POST "/issues/$ISSUE/comments" -d "$(jq -cn --arg b "$body" '{body: $b}')" >/dev/null \
-      || die "cannot comment on $REPO#$ISSUE"
-    if [ "$status" = "done" ]; then
+    # Mission-control has the record. Only now is GitHub written. Each step is
+    # marked as it lands, so a replay after a partial failure repeats nothing.
+    mark() { jq -c --arg k "$1" '. + {($k): true}' "$STATE" >"$STATE.tmp" && mv "$STATE.tmp" "$STATE"; }
+    if [ "$(jq -r '.commented // false' "$STATE")" != true ]; then
+      # shellcheck disable=SC2016
+      body=$(printf '### Pipeline phase `%s`: %s\n\n%s\n\n<sub>run `%s` · conversation `%s`</sub>' \
+        "$PHASE" "$status" "$summary" "$RUN_ID" "$OPENHANDS_SESSION_ID")
+      gh_api POST "/issues/$ISSUE/comments" -d "$(jq -cn --arg b "$body" '{body: $b}')" >/dev/null \
+        || die "cannot comment on $REPO#$ISSUE"
+      mark commented
+    fi
+    if [ "$status" = "done" ] && [ "$(jq -r '.labelled // false' "$STATE")" != true ]; then
       gh_api POST "/issues/$ISSUE/labels" -d "$(jq -cn --arg l "$LABEL_TO" '{labels: [$l]}')" >/dev/null \
         || die "cannot add label $LABEL_TO"
       # A label that is already gone is the state we want.
       gh_api DELETE "/issues/$ISSUE/labels/$(jq -rn --arg l "$LABEL_FROM" '$l | @uri')" >/dev/null 2>&1 || true
+      mark labelled
     fi
-    jq -c '. + {published: true}' "$STATE" >"$STATE.tmp" && mv "$STATE.tmp" "$STATE"
     ;;
 
   *) exit 0 ;;

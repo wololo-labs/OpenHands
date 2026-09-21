@@ -8,21 +8,23 @@ WORK=$(mktemp -d)
 trap 'kill "$STUB_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
 # The stub logs "METHOD PATH BODY" per request. Any mission-control path answers
-# 500 while $WORK/fail-mc exists.
+# 500 while $WORK/fail-mc exists, and label writes answer 500 while
+# $WORK/fail-labels exists.
 # shellcheck disable=SC2016
 node -e '
-const http = require("http"), fs = require("fs"), [log, portFile, failFlag] = process.argv.slice(1);
+const http = require("http"), fs = require("fs"), [log, portFile, failFlag, failLabels] = process.argv.slice(1);
 http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c)).on("end", () => {
     fs.appendFileSync(log, `${req.method} ${req.url} ${body}\n`);
     const mc = req.url.startsWith("/api/");
     if (mc && fs.existsSync(failFlag)) { res.writeHead(500); return res.end("{}"); }
+    if (req.url.includes("/labels") && fs.existsSync(failLabels)) { res.writeHead(500); return res.end("{}"); }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(mc ? { ok: true, workUnitId: "01HZX3V9K4TQ5RB2C6D7E8F9G0" } : { title: "three review findings" }));
   });
 }).listen(0, "127.0.0.1", function () { fs.writeFileSync(portFile, String(this.address().port)); });
-' "$WORK/requests.log" "$WORK/port" "$WORK/fail-mc" &
+' "$WORK/requests.log" "$WORK/port" "$WORK/fail-mc" "$WORK/fail-labels" &
 STUB_PID=$!
 for _ in $(seq 50); do [ -s "$WORK/port" ] && break; sleep 0.1; done
 URL="http://127.0.0.1:$(cat "$WORK/port")"
@@ -87,6 +89,27 @@ touch "$WORK/fail-mc"; reset
 set +e; run_hook s3 Stop 2>/dev/null; code=$?; set -e; rm "$WORK/fail-mc"
 check "mission-control failure: exits 1 (never 2, which would block the agent)" 1 "$code"
 check "mission-control failure: GitHub is never written" "" "$(requests | grep /repos/ || true)"
+
+reset; run_hook s5 SessionStart; echo '{"status":"done","summary":"x"}' >"$WORK/project-s5/.agents/phase-result.json"
+touch "$WORK/fail-labels"; reset
+set +e; run_hook s5 Stop 2>/dev/null; set -e; rm "$WORK/fail-labels"; run_hook s5 Stop
+check "label write fails, then a replay: one comment in total, and the label swap completes" \
+  "1 comment, 2 label adds, 1 label delete" \
+  "$(requests | awk '/comments/{c++} /POST .*labels/{a++} /DELETE/{d++} END{printf "%d comment, %d label adds, %d label delete", c, a, d}')"
+
+reset; run_hook s6 SessionStart; reset
+jq -cn '{status: "done", summary: "ping @acme/everyone, token gh-secret"}' >"$WORK/project-s6/.agents/phase-result.json"
+run_hook s6 Stop
+check "a summary carrying a node token is withheld, reported blocked, and the label is left alone" \
+  "blocked Summary withheld: it contained a credential. no-label-write" \
+  "$(grep receipts "$WORK/requests.log" | cut -d' ' -f3- | jq -r '"\(.payload.status) \(.payload.summary)"') $(requests | grep -q labels && echo label-write || echo no-label-write)"
+check "the withheld token appears nowhere in what was sent" "" "$(grep -c gh-secret "$WORK/requests.log" | grep -v '^0$' || true)"
+
+reset; run_hook s7 SessionStart; reset
+jq -cn '{status: "done", summary: "cc @acme/everyone"}' >"$WORK/project-s7/.agents/phase-result.json"
+run_hook s7 Stop
+check "mentions in a summary are defused before they reach the issue" "no-live-mention" \
+  "$(grep comments "$WORK/requests.log" | cut -d' ' -f3- | jq -r .body | grep -q '@acme' && echo live-mention || echo no-live-mention)"
 
 chmod 644 "$WORK/config/mc-token"; reset
 set +e; run_hook s4 SessionStart 2>/dev/null; code=$?; set -e
