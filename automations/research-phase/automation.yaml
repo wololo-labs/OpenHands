@@ -1,0 +1,16 @@
+# Research phase of the agent pipeline: one run starts one conversation on a
+# fleet node, and that conversation's hooks report the phase.
+#
+# The tarball is built by make-tarball.sh, not from this directory alone: it
+# adds config.env (node, repo, issue, workspace, mission-control URL), which is
+# site-specific and therefore never committed.
+name: pipeline-research-phase
+entrypoint: bash entrypoint.sh
+# The service requires a trigger. Runs are started by POST /v1/{id}/dispatch;
+# 31 February never arrives, so the schedule never fires.
+trigger:
+  type: cron
+  schedule: "0 0 31 2 *"
+timeout: 300
+keep_alive: false
+enabled: true
