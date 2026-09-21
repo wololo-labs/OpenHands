@@ -76,6 +76,14 @@ request=$(jq -cn --arg profile "$profile" --arg dir "$WORKSPACE_DIR" --arg hook 
     }
   }')
 
-response=$(master -fsS -m 120 -H 'content-type: application/json' -d "$request" "$NODE/api/conversations")
+# Keep the body on a refusal: the agent-server's 422 names the offending field,
+# and curl -f would throw that away.
+response=$(master -sS -m 120 -w '\n%{http_code}' -H 'content-type: application/json' -d "$request" "$NODE/api/conversations")
+status=${response##*$'\n'}
+response=${response%$'\n'*}
+case "$status" in
+  2*) ;;
+  *) echo "node $NODE_ID refused the conversation ($status): ${response:0:1000}" >&2; exit 1 ;;
+esac
 CONVERSATION_ID=$(jq -er .id <<<"$response")
 echo "run $RUN_ID started conversation $CONVERSATION_ID on node $NODE_ID"
