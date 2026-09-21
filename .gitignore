@@ -58,3 +58,6 @@ build-fresh/
 .agents/research/
 .agents/scratch/
 .agents/handover/
+
+# Written by a pipeline-phase agent in its own worktree; read by the phase hook.
+.agents/phase-result.json

@@ -20,7 +20,9 @@ FAILED=0
 claim() { # claim <text> <expected> <actual>
   if [ "$2" = "$3" ]; then echo "PASS $1"; else FAILED=1; echo "FAIL $1 (expected '$2', got '$3')"; fi
 }
-node_get() { curl -fsS -m 30 -H "X-Session-API-Key: $(cat "$MASTER_KEY_FILE")" "$MASTER_URL/backend/$NODE_ID$1"; }
+node_get() {
+  curl -fsS -m 30 -K <(printf 'header = "X-Session-API-Key: %s"\n' "$(cat "$MASTER_KEY_FILE")") "$MASTER_URL/backend/$NODE_ID$1"
+}
 table() { (cd "$MC_DIR" && npx convex data "$1" --limit 500 --format jsonl 2>/dev/null); }
 
 conversation=$(node_get "/api/conversations/$CONVERSATION")
@@ -33,7 +35,7 @@ claim "agent wrote a done result file" "done" "$(jq -r '.status // "missing"' <<
 spans=$(table phaseSpans | jq -c --arg a "$PHASE-$CONVERSATION" --arg b "$SPAN_ID" 'select(.spanId == $a or .spanId == $b)')
 claim "exactly one phase span for the conversation" 1 "$(grep -c . <<<"$spans" || true)"
 claim "span is closed, done, observed, on the $PHASE step" "done observed true flow-default:$PHASE" \
-  "$(jq -r '"\(.status) \(.fidelity) \(.endMs != null) \(.stepId)"' <<<"$spans")"
+  "$(jq -rs 'map("\(.status) \(.fidelity) \(.endMs != null) \(.stepId)") | join(" | ")' <<<"$spans")"
 
 receipts=$(table agentRunReceipts | jq -c --arg run "$RUN_ID" 'select(.runId == $run)' | jq -sc 'sort_by(.sequence)')
 claim "receipts 1 and 2, in order, no gap" "1:run.started 2:phase.completed" \
