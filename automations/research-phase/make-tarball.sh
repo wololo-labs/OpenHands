@@ -16,7 +16,7 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 cp "$ROOT/automations/research-phase/tarball/entrypoint.sh" "$stage/"
 cp "$ROOT/.agents/dag/$PHASE.md" "$stage/"
-for name in NODE_ID REPO ISSUE WORKSPACE_DIR MC_SITE_URL PHASE MASTER_URL LABEL_FROM LABEL_TO; do
+for name in NODE_ID REPO ISSUE WORKSPACE_DIR MC_SITE_URL PHASE MASTER_URL LABEL_FROM LABEL_TO HOOK_PATH; do
   [ -n "${!name:-}" ] && printf '%s=%q\n' "$name" "${!name}"
 done >"$stage/config.env"
 

@@ -53,9 +53,12 @@ profile=$(master -fsS -m 15 "$NODE/api/settings" | jq -r '.active_agent_profile_
 
 # Non-secret run context reaches the hook through its command line: hook
 # processes inherit neither the conversation's secrets nor this environment.
+# The script is addressed under the node user's home, never relative to the
+# conversation's working directory, which the agent can write to.
 hook=$(jq -rn --arg repo "$REPO" --arg issue "$ISSUE" --arg run "$RUN_ID" --arg mc "$MC_SITE_URL" --arg phase "$PHASE" \
   --arg from "${LABEL_FROM:-phase:$PHASE}" --arg to "${LABEL_TO:-phase:$PHASE-done}" \
-  '"REPO=\($repo|@sh) ISSUE=\($issue|@sh) RUN_ID=\($run|@sh) MC_SITE_URL=\($mc|@sh) PHASE=\($phase|@sh) LABEL_FROM=\($from|@sh) LABEL_TO=\($to|@sh) bash automations/research-phase/tarball/hooks/phase.sh"')
+  --arg path "${HOOK_PATH:-.local/libexec/oh-pipeline/phase.sh}" \
+  '"REPO=\($repo|@sh) ISSUE=\($issue|@sh) RUN_ID=\($run|@sh) MC_SITE_URL=\($mc|@sh) PHASE=\($phase|@sh) LABEL_FROM=\($from|@sh) LABEL_TO=\($to|@sh) bash \"$HOME\"/\($path|@sh)"')
 
 request=$(jq -cn --arg profile "$profile" --arg dir "$WORKSPACE_DIR" --arg hook "$hook" --arg repo "$REPO" \
   --arg issue "$ISSUE" --arg run "$RUN_ID" --arg phase "$PHASE" --rawfile prompt "./$PHASE.md" '
@@ -65,7 +68,7 @@ request=$(jq -cn --arg profile "$profile" --arg dir "$WORKSPACE_DIR" --arg hook 
     workspace: {working_dir: $dir},
     worktree: true,
     tags: {pipeline_phase: $phase, pipeline_run: $run, pipeline_issue: "\($repo)#\($issue)"},
-    hook_config: {session_start: on(60), stop: on(120)},
+    hook_config: {session_start: on(180), stop: on(180)},
     initial_message: {
       role: "user", run: true,
       content: [{type: "text", text: ($prompt | gsub("\\{\\{ISSUE\\}\\}"; $issue) | gsub("\\{\\{REPO\\}\\}"; $repo))}]

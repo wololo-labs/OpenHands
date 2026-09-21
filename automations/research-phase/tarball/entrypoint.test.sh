@@ -69,5 +69,12 @@ check "request: start and stop run the same hook, and it evaluates to the run co
   "$(cmd=$(jq -r '.hook_config | [.session_start, .stop] | map(.[0].hooks[0].command) | unique | .[]' <<<"$body")
      eval "${cmd% bash *}"; echo "$REPO $ISSUE $RUN_ID $MC_SITE_URL $LABEL_TO")"
 
+# shellcheck disable=SC2016
+check "request: the hook script is addressed under the node home, never the agent's worktree" \
+  'bash "$HOME"/'"'.local/libexec/oh-pipeline/phase.sh'" \
+  "$(jq -r '.hook_config.stop[0].hooks[0].command' <<<"$body" | grep -o 'bash .*$')"
+check "request: hooks get longer than their own worst case" "180 180" \
+  "$(jq -r '"\(.hook_config.session_start[0].hooks[0].timeout) \(.hook_config.stop[0].hooks[0].timeout)"' <<<"$body")"
+
 [ "$FAILED" = 0 ] && echo "all checks passed"
 exit "$FAILED"
