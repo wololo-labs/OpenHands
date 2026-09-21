@@ -1,0 +1,19 @@
+# Research phase of the agent pipeline: one run starts one conversation on a
+# fleet node, and that conversation's hooks report the phase.
+#
+# The tarball is built by make-tarball.sh, not from this directory alone: it
+# adds config.env (node, repo, issue, workspace, mission-control URL), which is
+# site-specific and therefore never committed.
+name: pipeline-research-phase
+entrypoint: bash entrypoint.sh
+# The service requires a trigger. This is the one the pipeline is heading for: a
+# human (or the previous phase) applies the label. It stays inert until the
+# service has a GitHub webhook secret, and until then a run is started with
+# POST /v1/{id}/dispatch.
+trigger:
+  type: event
+  source: github
+  "on": issues.labeled
+  filter: "label.name == 'phase:research'"
+timeout: 300
+keep_alive: false
