@@ -67,7 +67,8 @@ request=$(jq -cn --arg profile "$profile" --arg dir "$WORKSPACE_DIR" --arg hook 
     agent_profile_id: $profile,
     workspace: {working_dir: $dir},
     worktree: true,
-    tags: {pipeline_phase: $phase, pipeline_run: $run, pipeline_issue: "\($repo)#\($issue)"},
+    # Tag keys must be lowercase alphanumeric or the agent-server answers 422.
+    tags: {pipelinephase: $phase, pipelinerun: $run, pipelineissue: "\($repo)#\($issue)"},
     hook_config: {session_start: on(180), stop: on(180)},
     initial_message: {
       role: "user", run: true,
