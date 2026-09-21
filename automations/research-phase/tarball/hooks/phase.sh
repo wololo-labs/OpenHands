@@ -40,15 +40,17 @@ read_token() {
   cat "$file"
 }
 
+# Tokens go to curl through a config file descriptor, never argv, so they do
+# not show up in the process list the agent can read.
 mc_post() {
-  curl -fsS -m 20 -X POST -H "X-WC-Token: $MC_TOKEN" -H 'content-type: application/json' \
+  curl -fsS -m 20 -X POST -K <(printf 'header = "X-WC-Token: %s"\n' "$MC_TOKEN") -H 'content-type: application/json' \
     -d "$2" "$MC_SITE_URL$1" || die "mission-control rejected POST $1"
 }
 
 gh_api() {
   local method=$1 path=$2
   shift 2
-  curl -fsS -m 20 -X "$method" -H "Authorization: Bearer $GH_TOKEN" \
+  curl -fsS -m 20 -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN") \
     -H 'Accept: application/vnd.github+json' "$@" "$GITHUB_API/repos/$REPO$path"
 }
 
