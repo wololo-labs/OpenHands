@@ -22,6 +22,10 @@
 # Known limit: the agent runs as the same unix user as this hook, so it can
 # still read the token files and the state directory. Closing that needs the
 # hook to run as another user, or the writes to move behind a broker.
+#
+# Known limit: Stop fires only when a conversation finishes. One that errors or
+# is cancelled leaves its span open and receipt 2 missing. That is the honest
+# record of what happened, but nothing closes it; a reaper on span age would.
 set -euo pipefail
 
 : "${REPO:?}" "${ISSUE:?}" "${RUN_ID:?}" "${MC_SITE_URL:?}"
@@ -42,11 +46,13 @@ TITLE_MAX=200 # mission-control refuses a longer work-unit title
 die() { echo "phase.sh: $*" >&2; exit 1; }
 
 read_token() {
-  local file="$CONFIG_DIR/$1"
+  local file="$CONFIG_DIR/$1" mode owner
   [ -f "$file" ] || die "missing token file $file"
-  # ls is the one permission read that behaves the same on GNU and BSD.
-  # shellcheck disable=SC2012
-  [ "$(ls -l "$file" | cut -c5-10)" = "------" ] || die "$file must be readable by its owner only"
+  # GNU stat first, BSD stat second.
+  mode=$(stat -c %a "$file" 2>/dev/null || stat -f %Lp "$file")
+  owner=$(stat -c %u "$file" 2>/dev/null || stat -f %u "$file")
+  [ "$mode" = 600 ] || [ "$mode" = 400 ] || die "$file must be mode 600 or 400, not $mode"
+  [ "$owner" = "$(id -u)" ] || die "$file must be owned by the user running the hook"
   cat "$file"
 }
 
@@ -95,7 +101,7 @@ case "$OPENHANDS_EVENT_TYPE" in
     [ -f "$STATE" ] && exit 0
     title=$(gh_api GET "/issues/$ISSUE" | jq -er .title) || die "cannot read issue $REPO#$ISSUE"
     WORK_UNIT_ID=$(mc_post /api/sync/work-unit "$(jq -cn --arg repo "$REPO" --argjson issue "$ISSUE" --arg title "${title:0:$TITLE_MAX}" \
-      '{repo: $repo, issueNumber: $issue, title: $title}')" | jq -er .workUnitId) || die "no workUnitId in response"
+      '{schemaVersion: 1, repo: $repo, issueNumber: $issue, title: $title}')" | jq -er .workUnitId) || die "no workUnitId in response"
     START_MS=$(now_ms)
     phase_event in-progress
     receipt 1 run.started "$(jq -cn --arg c "$OPENHANDS_SESSION_ID" --arg p "$PHASE" --argjson i "$ISSUE" \
@@ -106,8 +112,8 @@ case "$OPENHANDS_EVENT_TYPE" in
 
   Stop)
     [ -f "$STATE" ] || die "no state for session $OPENHANDS_SESSION_ID: SessionStart never completed"
-    WORK_UNIT_ID=$(jq -er .workUnitId "$STATE")
-    START_MS=$(jq -er .startMs "$STATE")
+    WORK_UNIT_ID=$(jq -er .workUnitId "$STATE") || die "state file $STATE has no workUnitId"
+    START_MS=$(jq -er .startMs "$STATE") || die "state file $STATE has no startMs"
 
     # The outcome is decided once, on the first Stop, and kept in the state
     # file. A later Stop replays it byte for byte: mission-control answers 200
@@ -116,8 +122,9 @@ case "$OPENHANDS_EVENT_TYPE" in
     if [ "$(jq -r '.status // empty' "$STATE")" = "" ]; then
       result="$PROJECT_DIR/.agents/phase-result.json"
       # No result file, or one that is not the agreed shape, is reported as
-      # blocked. A finished run that forgot the file is a false negative, which
-      # is the safe direction: nothing is recorded as done on say-so alone.
+      # blocked: a finished run that forgot the file is a false negative, the
+      # safe direction. A done result is still the agent's own word. Nothing
+      # here verifies it; the next phase and the human reading the comment do.
       if status=$(jq -er 'select(.status == "done" or .status == "blocked") | .status' "$result" 2>/dev/null); then
         summary=$(jq -r '.summary // "" | tostring' "$result")
       else
@@ -157,8 +164,12 @@ case "$OPENHANDS_EVENT_TYPE" in
     if [ "$status" = "done" ] && [ "$(jq -r '.labelled // false' "$STATE")" != true ]; then
       gh_api POST "/issues/$ISSUE/labels" -d "$(jq -cn --arg l "$LABEL_TO" '{labels: [$l]}')" >/dev/null \
         || die "cannot add label $LABEL_TO"
-      # A label that is already gone is the state we want.
-      gh_api DELETE "/issues/$ISSUE/labels/$(jq -rn --arg l "$LABEL_FROM" '$l | @uri')" >/dev/null 2>&1 || true
+      # A label that is already gone (404) is the state we want. Anything else
+      # that is not success is a real failure and must not pass silently.
+      code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -X DELETE \
+        -K <(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN") -H 'Accept: application/vnd.github+json' \
+        "$GITHUB_API/repos/$REPO/issues/$ISSUE/labels/$(jq -rn --arg l "$LABEL_FROM" '$l | @uri')")
+      case "$code" in 200 | 204 | 404) ;; *) die "cannot remove label $LABEL_FROM (GitHub answered $code)" ;; esac
       mark labelled
     fi
     ;;
